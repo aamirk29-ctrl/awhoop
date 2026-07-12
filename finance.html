@@ -78,6 +78,9 @@ body::after {
   max-width: 880px;
   margin: 0 auto;
   padding: 24px 16px 100px;   /* extra bottom padding so tab bar doesn't cover content */
+  padding-top: max(24px, env(safe-area-inset-top));
+  padding-left: max(16px, env(safe-area-inset-left));
+  padding-right: max(16px, env(safe-area-inset-right));
 }
 
 /* ===== Back to dashboard ===== */
