@@ -1213,9 +1213,11 @@ main {
   // your Vercel deployment (see api/whoop-token.js).
   // =============================================================
   const WHOOP_CONFIG = {
-    clientId: 'PASTE-YOUR-WHOOP-CLIENT-ID-HERE',
-    // Leave blank to derive from the current page URL (origin + path).
-    redirectUri: '',
+    clientId: '719b8967-05b8-433a-bbf7-11dec624dba6',
+    // Must exactly match the Redirect URI registered on developer.whoop.com.
+    // WHOOP redirects to index.html (not this page), which catches the
+    // code, exchanges it, and forwards the browser here once connected.
+    redirectUri: 'https://awhoop.vercel.app/index.html',
   };
 
   const SCOPES = 'offline read:recovery read:sleep read:workout read:cycles read:profile read:body_measurement';

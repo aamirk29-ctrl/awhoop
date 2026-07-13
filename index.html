@@ -1321,5 +1321,43 @@ document.addEventListener('DOMContentLoaded', function () {
   });
 });
 </script>
+<script>
+// WHOOP OAuth lands here (this page is the registered Redirect URI) even
+// though the WHOOP card itself lives on health.html. Exchange the code,
+// stash the tokens in localStorage (shared across pages on this origin),
+// then send the user on to health.html to see the connected card.
+(() => {
+  'use strict';
+  const params = new URLSearchParams(location.search);
+  const code = params.get('code');
+  const state = params.get('state');
+  if (!code || !state) return;
+
+  history.replaceState(null, '', location.pathname + location.hash);
+
+  const expectedState = sessionStorage.getItem('whoop_oauth_state');
+  sessionStorage.removeItem('whoop_oauth_state');
+  if (state !== expectedState) return;
+
+  fetch('/api/whoop-token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: location.origin + '/index.html',
+    }),
+  })
+    .then(res => res.json().then(data => ({ ok: res.ok, data })))
+    .then(({ ok, data }) => {
+      if (!ok) throw new Error(data.error || 'Token exchange failed');
+      localStorage.setItem('whoop_access_token', data.access_token);
+      if (data.refresh_token) localStorage.setItem('whoop_refresh_token', data.refresh_token);
+      localStorage.setItem('whoop_token_expires_at', String(Date.now() + (data.expires_in || 3600) * 1000));
+      location.href = 'health.html';
+    })
+    .catch(() => {});
+})();
+</script>
 </body>
 </html>
