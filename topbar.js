@@ -180,7 +180,7 @@ body.topbar-modal-open {
     <span class="topbar-pill-count" id="topbarStackCount">—/—</span>
   </a>
   <div class="topbar-water-wrap">
-    <a href="health.html#water" class="topbar-water-pill" id="topbarWater">
+    <a href="po-water.html" class="topbar-water-pill" id="topbarWater">
       <span class="topbar-pill-dot"></span>
       <span class="topbar-pill-label">WATER</span>
       <span class="topbar-pill-count" id="topbarWaterCount">—/—</span>
@@ -321,10 +321,10 @@ body.topbar-modal-open {
   }
 
   async function pushWaterMergedToSupabase(localWater) {
-    // Only do this when we're NOT on the health page — health page
-    // has its own sync that already detects the localStorage change.
-    if (window.location.pathname.endsWith('/health.html') ||
-        window.location.pathname.endsWith('health.html')) return;
+    // Only do this when we're NOT on health.html or po-water.html — both
+    // pages have their own sync that already detects the localStorage change.
+    if (window.location.pathname.endsWith('health.html') ||
+        window.location.pathname.endsWith('po-water.html')) return;
 
     if (!window.supabase || !TOPBAR_SUPABASE_URL || !TOPBAR_SUPABASE_KEY) return;
     if (TOPBAR_SUPABASE_URL.indexOf('PASTE-') === 0) return;
