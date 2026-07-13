@@ -1,0 +1,163 @@
+@import "tailwindcss";
+
+@theme {
+  --color-base: #050506;
+  --color-ink: #fafafa;
+  --color-ink-2: #b8b6b0;
+  --color-ink-3: #76746e;
+  --color-ink-4: #4d4b47;
+  --color-good: #6be3a4;
+  --color-warn: #f2c063;
+  --color-bad: #ff8a8a;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: var(--color-base);
+  color: var(--color-ink-2);
+  min-height: 100%;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  overflow-x: hidden;
+}
+
+/* Film-grain dot overlay shared by every page of the old app — kept for texture. */
+.grain::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image: radial-gradient(rgba(255, 255, 255, 0.014) 1px, transparent 1px);
+  background-size: 3px 3px;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Hide scrollbars on mobile like the old pages did */
+@media (max-width: 768px) {
+  ::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+    display: none;
+  }
+  html,
+  body {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+}
+::-webkit-scrollbar {
+  width: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+}
+
+::selection {
+  background: rgba(224, 118, 88, 0.3);
+  color: var(--color-ink);
+}
+
+input[type="date"] {
+  color-scheme: dark;
+}
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.85);
+  opacity: 0.7;
+  cursor: pointer;
+}
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+}
+
+body.panel-open {
+  overflow: hidden;
+}
+
+/* ===== Aurora background blobs ===== */
+@keyframes aurora-a {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    transform: translate3d(-4%, 3%, 0) scale(1.08);
+  }
+}
+@keyframes aurora-b {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1.05);
+  }
+  100% {
+    transform: translate3d(3%, -4%, 0) scale(0.95);
+  }
+}
+.aurora-blob {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(70px);
+  pointer-events: none;
+  will-change: transform;
+}
+.aurora-blob-a {
+  animation: aurora-a 32s ease-in-out infinite alternate;
+}
+.aurora-blob-b {
+  animation: aurora-b 40s ease-in-out infinite alternate;
+}
+@media (prefers-reduced-motion: reduce) {
+  .aurora-blob-a,
+  .aurora-blob-b {
+    animation: none;
+  }
+}
+
+/* ===== Bento card hover shine ===== */
+.bento-shine {
+  position: relative;
+  overflow: hidden;
+}
+.bento-shine::after {
+  content: "";
+  position: absolute;
+  top: -60%;
+  bottom: -60%;
+  left: -30%;
+  width: 36%;
+  background: linear-gradient(
+    100deg,
+    transparent,
+    rgba(255, 255, 255, 0.055),
+    transparent
+  );
+  transform: translateX(-160%) rotate(12deg);
+  transition: transform 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: none;
+}
+.bento-shine:hover::after {
+  transform: translateX(620%) rotate(12deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .bento-shine::after {
+    display: none;
+  }
+}

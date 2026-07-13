@@ -1,38 +1,51 @@
-# Personal Dashboard
+# Personal Dashboard — Bento Edition
 
-A set of small, self-contained HTML apps that share a top bar.
+A Next.js dashboard where five self-tracking apps live in one dark bento grid:
+**Goals · Stack (supplements + WHOOP) · Water · Gym · Finance**. Each tile shows
+a live metric; clicking a tile expands it in place (shared-layout animation)
+into the full app.
 
-## Deploy your own copy
+Built from the original static-HTML pages (now archived in [`legacy/`](legacy/))
+— the data layer is unchanged: same localStorage keys, same Supabase `app_state`
+rows (`goals`, `health`, `po-coach`, `finance`), so existing data and multi-device
+sync carry over as-is.
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FRowanThistlebrooke%2FYTdashh1)
+## Develop
 
-One click → Vercel signs you in, copies the repo to your GitHub, and deploys it. ~30 seconds to a live URL.
+```bash
+npm install
+npm run dev        # http://localhost:3000
+npm run build      # production build
+```
 
-## How to use
+## Structure
 
-Open any `.html` file directly in your browser — no build step, no install.
-
-| File | What it is |
+| Path | What it is |
 |---|---|
-| [index.html](index.html) | Goals tracker (Day Ring, Goal Ticker, To Do list) — the home page |
-| [health.html](health.html) | Supplement / daily stack tracker, with a live WHOOP recovery/sleep/strain card at the top |
-| [po-water.html](po-water.html) | Water intake tracker |
-| [finance.html](finance.html) | Finances |
-| [gym.html](gym.html) | Progressive overload gym tracker |
-| [topbar.js](topbar.js) | Shared top bar — auto-injected into pages that `<script src="topbar.js">` |
+| `app/page.tsx` | Bento dashboard — greeting, status pills, 5 tiles, CTA banner, expand-in-place routing (`/?p=goals` … `/?p=finance`) |
+| `components/ui/aurora-bento-grid.tsx` | AuroraBackground / BentoGrid / BentoGridItem / BentoExpandedOverlay (motion `layoutId` transitions) |
+| `components/panels/` | The five full apps, one per panel |
+| `components/whoop-card.tsx` | Live WHOOP recovery/sleep/strain card (inside Stack) |
+| `lib/` | Data layer: reactive localStorage store, multi-channel Supabase sync, per-domain models (water, gym, finance, supplements) |
+| `app/api/whoop-*` | WHOOP OAuth callback, token refresh, and data proxy (client secret stays server-side) |
+| `legacy/` | The original standalone HTML pages, kept for reference |
 
-Each app stores its own state in browser `localStorage`. No accounts, no server.
+Old bookmarks (`/gym.html` etc.) redirect to the matching expanded panel.
 
-## WHOOP setup (health.html)
+## WHOOP setup
 
-The WHOOP card needs a backend, because WHOOP's OAuth token endpoint requires a client secret that can never reach the browser. This repo ships three Vercel serverless functions for that — `api/whoop-callback.js` (OAuth redirect target + token exchange), `api/whoop-refresh.js` (refreshes an expired access token), and `api/whoop-data.js` (proxies recovery/sleep/cycle reads) — they deploy automatically with the rest of the site on Vercel.
+The WHOOP card needs three route handlers (deployed automatically with the app)
+because WHOOP's token endpoint requires a client secret that can never reach the
+browser.
 
-1. Create an app at [developer.whoop.com](https://developer.whoop.com) and grab its **Client ID** and **Client Secret**.
-2. Register a **Redirect URI** there that points at the callback function itself, not a page: `https://your-site.vercel.app/api/whoop-callback`.
-3. In your Vercel project settings, add environment variables `WHOOP_CLIENT_ID`, `WHOOP_CLIENT_SECRET`, and `WHOOP_REDIRECT_URI` (same value as step 2).
-4. Open `health.html`, find `CLIENT_ID` in the WHOOP card's `<script>` block, and set it to your Client ID (this one is public, safe to hardcode — only the secret needs to stay server-side, in Vercel env vars).
-5. Redeploy, open the Health page, and hit **Connect WHOOP**.
+1. Create an app at [developer.whoop.com](https://developer.whoop.com) — grab its **Client ID** and **Client Secret**.
+2. Register the **Redirect URI** `https://your-site.vercel.app/api/whoop-callback`.
+3. In Vercel project settings, set env vars `WHOOP_CLIENT_ID`, `WHOOP_CLIENT_SECRET`, `WHOOP_REDIRECT_URI` (same value as step 2).
+4. Set `CLIENT_ID` in `components/whoop-card.tsx` to your Client ID (public — only the secret must stay server-side).
+5. Deploy, open the Stack panel, hit **Connect WHOOP**.
 
-## Building from scratch
+## Sync
 
-[BUILD_DASHBOARD.md](BUILD_DASHBOARD.md) is the prompt I gave Claude to generate `index.html` — paste it into Claude if you want to rebuild that page yourself.
+`lib/cloud-sync.ts` mirrors each domain to one row of the Supabase `app_state`
+table and subscribes to realtime changes, so edits appear on other devices within
+~1 second. Leave the Supabase constants as placeholders for a local-only build.

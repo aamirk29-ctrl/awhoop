@@ -6,3 +6,9 @@
 
 # Screenshots that may contain secrets (e.g. WHOOP client secret)
 Screenshot *.png
+node_modules
+
+# Next.js
+node_modules/
+.next/
+next-env.d.ts
