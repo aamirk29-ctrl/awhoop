@@ -25,13 +25,13 @@ Each app stores its own state in browser `localStorage`. No accounts, no server.
 
 ## WHOOP setup (health.html)
 
-The WHOOP card needs a backend, because WHOOP's OAuth token endpoint requires a client secret that can never reach the browser. This repo ships two Vercel serverless functions for that (`api/whoop-token.js`, `api/whoop-data.js`) — they deploy automatically with the rest of the site on Vercel.
+The WHOOP card needs a backend, because WHOOP's OAuth token endpoint requires a client secret that can never reach the browser. This repo ships three Vercel serverless functions for that — `api/whoop-callback.js` (OAuth redirect target + token exchange), `api/whoop-refresh.js` (refreshes an expired access token), and `api/whoop-data.js` (proxies recovery/sleep/cycle reads) — they deploy automatically with the rest of the site on Vercel.
 
 1. Create an app at [developer.whoop.com](https://developer.whoop.com) and grab its **Client ID** and **Client Secret**.
-2. Register a **Redirect URI** there that exactly matches your deployed `health.html` URL, e.g. `https://your-site.vercel.app/health.html`.
-3. In your Vercel project settings, add environment variables `WHOOP_CLIENT_ID` and `WHOOP_CLIENT_SECRET`.
-4. Open `health.html`, find the `WHOOP_CONFIG` block near the bottom, and set `clientId` to your Client ID (this one is public, safe to hardcode — only the secret needs to stay server-side).
-5. Redeploy, open the page, and hit **Connect WHOOP**.
+2. Register a **Redirect URI** there that points at the callback function itself, not a page: `https://your-site.vercel.app/api/whoop-callback`.
+3. In your Vercel project settings, add environment variables `WHOOP_CLIENT_ID`, `WHOOP_CLIENT_SECRET`, and `WHOOP_REDIRECT_URI` (same value as step 2).
+4. Open `health.html`, find `CLIENT_ID` in the WHOOP card's `<script>` block, and set it to your Client ID (this one is public, safe to hardcode — only the secret needs to stay server-side, in Vercel env vars).
+5. Redeploy, open the Health page, and hit **Connect WHOOP**.
 
 ## Building from scratch
 
