@@ -38,7 +38,15 @@ const CHANNELS: Channel[] = [
   },
   {
     appKey: 'health',
-    syncedKeys: ['stack:items', 'stack:version', 'stack:low', 'po_water_v1'],
+    syncedKeys: [
+      'stack:items',
+      'stack:version',
+      'stack:low',
+      'po_water_v1',
+      'nutrition_v1',
+      'whoop_burn_v1',
+      'food_log_v1',
+    ],
     syncedPrefixes: ['stack:taken:'],
   },
   {

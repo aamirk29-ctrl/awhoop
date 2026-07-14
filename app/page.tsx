@@ -4,7 +4,7 @@ import * as React from 'react';
 import dynamic from 'next/dynamic';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { MotionConfig, motion } from 'motion/react';
-import { Target, Pill, Droplets, Dumbbell, Wallet, Plus, type LucideIcon } from 'lucide-react';
+import { Target, Pill, Droplets, Dumbbell, Wallet, Apple, Plus, type LucideIcon } from 'lucide-react';
 import {
   AuroraBackground,
   BentoGrid,
@@ -20,14 +20,18 @@ import { activeDateKey, calendarDateKey, dateToKey, tomorrowDateKey, todayLabelU
 import { loadWaterState, targetUnits } from '@/lib/water';
 import { loadPoState, todaySplit, isRestName } from '@/lib/gym';
 import { ensureRates, fmtMoney } from '@/lib/fx';
+import { loadNutritionState, resolveTargets } from '@/lib/nutrition';
+import { loadCachedEnergy, recentClosedBurns, refreshWhoopEnergy } from '@/lib/whoop';
+import { entriesFor, loadFoodLog, progress, totalsFor } from '@/lib/food';
 
 const GoalsPanel = dynamic(() => import('@/components/panels/GoalsPanel'), { ssr: false });
 const StackPanel = dynamic(() => import('@/components/panels/StackPanel'), { ssr: false });
 const WaterPanel = dynamic(() => import('@/components/panels/WaterPanel'), { ssr: false });
 const GymPanel = dynamic(() => import('@/components/panels/GymPanel'), { ssr: false });
 const FinancePanel = dynamic(() => import('@/components/panels/FinancePanel'), { ssr: false });
+const NutritionPanel = dynamic(() => import('@/components/panels/NutritionPanel'), { ssr: false });
 
-type PanelId = 'goals' | 'stack' | 'water' | 'gym' | 'finance';
+type PanelId = 'goals' | 'stack' | 'water' | 'gym' | 'finance' | 'nutrition';
 
 const PANELS: Record<
   PanelId,
@@ -62,6 +66,12 @@ const PANELS: Record<
     icon: Wallet,
     accent: { from: '#FB7185', to: '#EF4444', text: '#FDA4AF' },
     maxWidth: 900,
+  },
+  nutrition: {
+    title: 'Nutrition',
+    icon: Apple,
+    accent: { from: '#FDBA74', to: '#FB7185', text: '#FDBA74' },
+    maxWidth: 720,
   },
 };
 
@@ -100,6 +110,9 @@ function Dashboard() {
   React.useEffect(() => {
     initCloudSync();
     ensureRates();
+    // Warms the shared burn cache so the Nutrition card shows the WHOOP-driven
+    // target without having to open the panel first. No-ops when not connected.
+    refreshWhoopEnergy().catch(() => {});
   }, []);
 
   const raw = searchParams.get('p');
@@ -156,12 +169,28 @@ function Dashboard() {
     const hist = (storeGet<{ v: number }[]>('nw:history') || []).map((p) => p.v).slice(-30);
     const nwDelta = hist.length >= 2 ? hist[hist.length - 1] - hist[0] : 0;
 
+    const energy = loadCachedEnergy();
+    const nutrition = resolveTargets(loadNutritionState(), energy, recentClosedBurns());
+    const eaten = totalsFor(entriesFor(loadFoodLog()));
+    const calProg = progress(eaten.kcal, nutrition.calorie.calorieTarget);
+    const proProg = progress(eaten.protein, nutrition.proteinTarget);
+
     return {
       goals: { done: goalsDone, total: goals.length, streak, tomorrowPlanned, pending: goalsPending },
       stack: { done: stackDone, total: stackItems.length },
       water: { count: waterCount, target: waterTarget },
       gym: { split: split.name, rest: isRestName(split.name), setsToday, week },
       finance: { nw, currency, hist, nwDelta },
+      nutrition: {
+        cal: calProg,
+        pro: proProg,
+        entries: eaten.count,
+        estimated: nutrition.estimated,
+        whoopRaising: nutrition.whoopRaising,
+        burn: energy
+          ? { resting: Math.round(energy.restingKcal), training: Math.round(energy.workoutKcal) }
+          : null,
+      },
     };
   }, [mounted, openId, tick]);
 
@@ -369,6 +398,88 @@ function Dashboard() {
             onOpen={() => open('finance')}
             className="md:col-span-3"
           />
+          <BentoGridItem
+            id="nutrition"
+            index={5}
+            title="Nutrition"
+            icon={P.nutrition.icon}
+            accent={P.nutrition.accent}
+            metric={m ? Math.round(m.nutrition.cal.consumed).toLocaleString() : '—'}
+            metricSuffix={m ? `/ ${Math.round(m.nutrition.cal.target).toLocaleString()} kcal` : undefined}
+            sub={
+              m ? (
+                m.nutrition.cal.over ? (
+                  <span className="text-warn">
+                    {Math.round(m.nutrition.cal.consumed - m.nutrition.cal.target).toLocaleString()} kcal over
+                    {' · '}
+                    {Math.round(m.nutrition.pro.remaining)}g protein left
+                  </span>
+                ) : (
+                  `${Math.round(m.nutrition.cal.remaining).toLocaleString()} kcal · ${Math.round(m.nutrition.pro.remaining)}g protein left today`
+                )
+              ) : undefined
+            }
+            viz={
+              <MiniRing
+                value={m?.nutrition.cal.consumed ?? 0}
+                max={m?.nutrition.cal.target ?? 1}
+                color={P.nutrition.accent.from}
+              />
+            }
+            body={
+              <div className="flex flex-col gap-2.5">
+                <CardBar
+                  label="CAL"
+                  pct={m?.nutrition.cal.pct ?? 0}
+                  over={!!m?.nutrition.cal.over}
+                  gradient={`linear-gradient(90deg, ${P.nutrition.accent.from}, ${P.nutrition.accent.to})`}
+                  right={
+                    m
+                      ? `${Math.round(m.nutrition.cal.consumed).toLocaleString()}/${Math.round(m.nutrition.cal.target).toLocaleString()}`
+                      : '—'
+                  }
+                />
+                <CardBar
+                  label="PRO"
+                  pct={m?.nutrition.pro.pct ?? 0}
+                  over={!!m?.nutrition.pro.over}
+                  gradient="linear-gradient(90deg, #E8E5DD, #B8B6B0)"
+                  right={
+                    m
+                      ? `${Math.round(m.nutrition.pro.consumed)}/${Math.round(m.nutrition.pro.target)}g`
+                      : '—'
+                  }
+                />
+                {/* why the target moved — WHOOP resting vs training burn */}
+                {m?.nutrition.burn && (
+                  <div className="mt-0.5 flex items-center gap-2 font-mono text-[10px] text-ink-3">
+                    <span className="inline-flex items-center gap-1">
+                      <span
+                        className="h-1.5 w-1.5 rounded-[2px]"
+                        style={{ background: `${P.nutrition.accent.from}88` }}
+                        aria-hidden
+                      />
+                      {m.nutrition.burn.resting.toLocaleString()} rest
+                    </span>
+                    <span className="inline-flex items-center gap-1">
+                      <span
+                        className="h-1.5 w-1.5 rounded-[2px]"
+                        style={{ background: P.nutrition.accent.to }}
+                        aria-hidden
+                      />
+                      {m.nutrition.burn.training.toLocaleString()} train
+                    </span>
+                    <span className="text-ink-4">
+                      burn{m.nutrition.estimated ? ' (est.)' : ''}
+                    </span>
+                  </div>
+                )}
+              </div>
+            }
+            expanded={openId === 'nutrition'}
+            onOpen={() => open('nutrition')}
+            className="md:col-span-6"
+          />
         </BentoGrid>
 
         {/* ===== CTA banner ===== */}
@@ -421,10 +532,48 @@ function Dashboard() {
             {openId === 'water' && <WaterPanel accent={PANELS.water.accent} />}
             {openId === 'gym' && <GymPanel accent={PANELS.gym.accent} />}
             {openId === 'finance' && <FinancePanel accent={PANELS.finance.accent} />}
+            {openId === 'nutrition' && <NutritionPanel accent={PANELS.nutrition.accent} />}
           </BentoExpandedOverlay>
         )}
       </AnimatePresence>
     </MotionConfig>
+  );
+}
+
+/** Slim consumed-vs-target bar for the collapsed Nutrition tile. */
+function CardBar({
+  label,
+  pct,
+  over,
+  gradient,
+  right,
+}: {
+  label: string;
+  pct: number;
+  over: boolean;
+  gradient: string;
+  right: string;
+}) {
+  return (
+    <div className="flex items-center gap-2.5">
+      <span className="w-[26px] shrink-0 font-mono text-[9.5px] font-bold tracking-[0.1em] text-ink-4">
+        {label}
+      </span>
+      <div className="h-[6px] flex-1 overflow-hidden rounded-full bg-white/[0.06]">
+        <div
+          className="h-full rounded-full transition-[width] duration-500"
+          style={{
+            width: `${Math.max(pct, 0)}%`,
+            background: over ? 'linear-gradient(90deg, #F2C063, #FF8A8A)' : gradient,
+          }}
+        />
+      </div>
+      <span
+        className={`shrink-0 font-mono text-[10px] font-semibold tabular-nums ${over ? 'text-warn' : 'text-ink-3'}`}
+      >
+        {right}
+      </span>
+    </div>
   );
 }
 

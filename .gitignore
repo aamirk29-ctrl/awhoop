@@ -12,6 +12,11 @@ node_modules
 node_modules/
 .next/
 next-env.d.ts
+tsconfig.tsbuildinfo
+
+# Local env — holds WHOOP_CLIENT_SECRET / USDA_FDC_API_KEY. Never commit.
+.env
+.env*.local
 
 # Local Claude tooling (keep only the project verify skill in git)
 .claude/*
