@@ -176,8 +176,9 @@ function Dashboard() {
 
   return (
     <MotionConfig reducedMotion="user">
-      <AuroraBackground />
-      <main className="relative z-[2] mx-auto max-w-[1060px] px-5 pb-14 pt-[max(1.75rem,env(safe-area-inset-top))]">
+      <div className="relative">
+        <AuroraBackground />
+        <main className="relative z-[2] mx-auto max-w-[1060px] px-5 pb-14 pt-[max(1.75rem,env(safe-area-inset-top))]">
         {/* ===== greeting header ===== */}
         <motion.header
           initial={{ opacity: 0, y: 10 }}
@@ -400,7 +401,8 @@ function Dashboard() {
             </button>
           </div>
         </motion.section>
-      </main>
+        </main>
+      </div>
 
       {/* ===== expand-in-place overlay ===== */}
       <AnimatePresence>

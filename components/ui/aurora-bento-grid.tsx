@@ -19,7 +19,7 @@ export type BentoAccent = {
 
 export function AuroraBackground({ className }: { className?: string }) {
   return (
-    <div className={cn('fixed inset-0 -z-10 overflow-hidden', className)} aria-hidden="true">
+    <div className={cn('absolute inset-0 -z-10 overflow-hidden', className)} aria-hidden="true">
       <div
         className="aurora-blob aurora-blob-a"
         style={{
