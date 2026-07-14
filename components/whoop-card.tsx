@@ -1,19 +1,23 @@
 'use client';
 
 // WHOOP recovery/sleep/strain card — port of the health.html card.
-// Tokens live in `whoop_tokens_v1`; OAuth lands on /api/whoop-callback which
-// redirects back to /?p=stack with tokens in the URL fragment.
+// Auth, token storage and fetching all live in lib/whoop.ts, which is shared
+// with the Nutrition panel. Refresh must stay single-sourced there: WHOOP
+// rotates the refresh token on use, so a second refresh path would 401 both
+// consumers out.
 
 import * as React from 'react';
 import { RefreshCw } from 'lucide-react';
-import { storeGet, storeSet, storeRemove } from '@/lib/storage';
+import {
+  buildAuthUrl,
+  captureTokensFromHash,
+  clearTokens,
+  loadTokens,
+  refreshWhoopEnergy,
+  whoopFetch,
+  type WhoopTokens,
+} from '@/lib/whoop';
 import { Card } from './panels/shared';
-
-const KEY = 'whoop_tokens_v1';
-const CLIENT_ID = '719b8967-05b8-433a-bbf7-11dec624dba6';
-const SCOPES = 'read:recovery read:sleep read:workout read:cycles read:profile read:body_measurement offline';
-
-type Tokens = { access: string; refresh?: string; expires?: number };
 
 type WhoopData = {
   recScore: number | null;
@@ -75,72 +79,23 @@ function fmtMinsShort(ms: number) {
 }
 
 export default function WhoopCard() {
-  const [tokens, setTokens] = React.useState<Tokens | null>(null);
+  const [tokens, setTokens] = React.useState<WhoopTokens | null>(null);
   const [data, setData] = React.useState<WhoopData | null>(null);
   const [err, setErr] = React.useState('');
   const [updated, setUpdated] = React.useState('');
   const [spinning, setSpinning] = React.useState(false);
   const [ready, setReady] = React.useState(false);
 
-  const refreshTok = React.useCallback(async (t: Tokens): Promise<Tokens | null> => {
-    if (!t.refresh) return null;
-    try {
-      const r = await fetch('/api/whoop-refresh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: t.refresh }),
-      });
-      const j = await r.json();
-      if (j.access_token) {
-        const next: Tokens = {
-          access: j.access_token,
-          refresh: j.refresh_token || t.refresh,
-          expires: Date.now() + (j.expires_in || 3500) * 1000,
-        };
-        storeSet(KEY, next);
-        setTokens(next);
-        return next;
-      }
-    } catch {
-      /* fall through */
-    }
-    return null;
-  }, []);
-
-  const whFetch = React.useCallback(
-    async (path: string, t: Tokens): Promise<Record<string, unknown>> => {
-      const [p, qs] = path.split('?');
-      const params = new URLSearchParams(qs || '');
-      params.set('path', p);
-      const r = await fetch(`/api/whoop-data?${params.toString()}`, {
-        headers: { Authorization: `Bearer ${t.access}`, Accept: 'application/json' },
-      });
-      if (r.status === 401) {
-        const n = await refreshTok(t);
-        if (n) return whFetch(path, n);
-        throw new Error('unauthorized — reconnect');
-      }
-      if (!r.ok) throw new Error(`WHOOP ${r.status}: ${await r.text()}`);
-      return r.json();
-    },
-    [refreshTok],
-  );
-
   const loadData = React.useCallback(
-    async (tIn?: Tokens | null) => {
-      let t = tIn ?? storeGet<Tokens>(KEY);
-      if (!t) return;
-      if (t.expires && Date.now() > t.expires - 60000) {
-        const n = await refreshTok(t);
-        if (n) t = n;
-      }
+    async () => {
+      if (!loadTokens()?.access) return;
       setErr('');
       try {
         /* eslint-disable @typescript-eslint/no-explicit-any */
         const [rec, sleep, cycle] = await Promise.all([
-          whFetch('/recovery?limit=1', t).catch(() => null),
-          whFetch('/activity/sleep?limit=1', t).catch(() => null),
-          whFetch('/cycle?limit=1', t).catch(() => null),
+          whoopFetch<any>('/recovery?limit=1').catch(() => null),
+          whoopFetch<any>('/activity/sleep?limit=1').catch(() => null),
+          whoopFetch<any>('/cycle?limit=1').catch(() => null),
         ]);
         const out: WhoopData = {
           recScore: null, hrv: null, rhr: null, skin: null, spo2: null,
@@ -183,43 +138,23 @@ export default function WhoopCard() {
         setErr(e instanceof Error ? e.message : String(e));
       }
     },
-    [refreshTok, whFetch],
+    [],
   );
 
   React.useEffect(() => {
-    // Pick up tokens from the OAuth callback's URL fragment.
-    if (location.hash.includes('whoop_access')) {
-      const h = new URLSearchParams(location.hash.slice(1));
-      const access = h.get('whoop_access');
-      if (access) {
-        const t: Tokens = {
-          access,
-          refresh: h.get('whoop_refresh') || undefined,
-          expires: Number(h.get('whoop_expires')) || Date.now() + 3500e3,
-        };
-        storeSet(KEY, t);
-        history.replaceState(null, '', location.pathname + location.search);
-      }
-    }
-    const t = storeGet<Tokens>(KEY);
+    captureTokensFromHash();
+    const t = loadTokens();
     setTokens(t);
     setReady(true);
-    if (t?.access) loadData(t);
+    if (t?.access) loadData();
   }, [loadData]);
 
   const connect = () => {
-    const url =
-      'https://api.prod.whoop.com/oauth/oauth2/auth' +
-      `?client_id=${encodeURIComponent(CLIENT_ID)}` +
-      `&redirect_uri=${encodeURIComponent(`${window.location.origin}/api/whoop-callback`)}` +
-      '&response_type=code' +
-      `&scope=${encodeURIComponent(SCOPES)}` +
-      `&state=${Math.random().toString(36).slice(2)}`;
-    window.location.href = url;
+    window.location.href = buildAuthUrl();
   };
 
   const disconnect = () => {
-    storeRemove(KEY);
+    clearTokens();
     setTokens(null);
     setData(null);
   };
@@ -227,7 +162,8 @@ export default function WhoopCard() {
   const refresh = async () => {
     setSpinning(true);
     try {
-      await loadData();
+      // Keep the Nutrition panel's burn figure in step with this card.
+      await Promise.all([loadData(), refreshWhoopEnergy().catch(() => null)]);
     } finally {
       setTimeout(() => setSpinning(false), 600);
     }
