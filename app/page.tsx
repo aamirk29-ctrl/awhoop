@@ -511,6 +511,39 @@ function Dashboard() {
               Plan tomorrow →
             </button>
           </div>
+
+          {/* End-of-day nutrition wrap-up. Only worth showing once something was
+              actually logged — an all-zero scorecard is noise, not a summary. */}
+          {m && m.nutrition.entries > 0 && (
+            <div className="mt-5 border-t border-white/[0.09] pt-4">
+              <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+                <div className="flex flex-wrap gap-x-6 gap-y-3">
+                  <DayScore
+                    label="CALORIES"
+                    consumed={m.nutrition.cal.consumed}
+                    target={m.nutrition.cal.target}
+                    unit="kcal"
+                    color={P.nutrition.accent.from}
+                  />
+                  <DayScore
+                    label="PROTEIN"
+                    consumed={m.nutrition.pro.consumed}
+                    target={m.nutrition.pro.target}
+                    unit="g"
+                    color="#E8E5DD"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => open('nutrition')}
+                  className="cursor-pointer rounded-full border border-white/[0.12] bg-white/[0.05] px-4 py-2 text-[12px] font-semibold text-ink-2 transition-colors hover:bg-white/[0.1] hover:text-ink"
+                >
+                  Review food log →
+                </button>
+              </div>
+              <p className="mt-3 text-[12px] text-ink-3">{dayVerdict(m.nutrition)}</p>
+            </div>
+          )}
         </motion.section>
         </main>
       </div>
@@ -538,6 +571,64 @@ function Dashboard() {
       </AnimatePresence>
     </MotionConfig>
   );
+}
+
+/** One macro's end-of-day score: consumed / target and % of target hit. */
+function DayScore({
+  label,
+  consumed,
+  target,
+  unit,
+  color,
+}: {
+  label: string;
+  consumed: number;
+  target: number;
+  unit: string;
+  color: string;
+}) {
+  const pct = target > 0 ? Math.round((consumed / target) * 100) : 0;
+  const over = consumed > target;
+  return (
+    <div>
+      <div className="font-mono text-[9.5px] font-bold uppercase tracking-[0.16em] text-ink-4">
+        {label}
+      </div>
+      <div className="mt-1 flex items-baseline gap-1.5">
+        <span
+          className="font-mono text-[20px] font-bold leading-none tabular-nums"
+          style={{ color: over ? '#F2C063' : color }}
+        >
+          {pct}%
+        </span>
+        <span className="font-mono text-[11px] tabular-nums text-ink-3">
+          {Math.round(consumed).toLocaleString()} / {Math.round(target).toLocaleString()} {unit}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** Plain-language read on the day. Protein under-shoot matters more than a small
+ *  calorie under-shoot on a recomp, so it's called out first. */
+function dayVerdict(n: {
+  cal: { consumed: number; target: number; over: boolean };
+  pro: { consumed: number; target: number; over: boolean };
+}): string {
+  const calPct = n.cal.target > 0 ? (n.cal.consumed / n.cal.target) * 100 : 0;
+  const proPct = n.pro.target > 0 ? (n.pro.consumed / n.pro.target) * 100 : 0;
+  const proteinShort = Math.round(n.pro.target - n.pro.consumed);
+
+  if (proPct < 80) {
+    return `Protein is ${proteinShort}g short — the one worth topping up before bed.`;
+  }
+  if (n.cal.over) {
+    const over = Math.round(n.cal.consumed - n.cal.target);
+    return `${over.toLocaleString()} kcal over target, protein hit. One day won't undo the week.`;
+  }
+  if (calPct >= 90 && proPct >= 100) return 'Calories and protein both on target — textbook day.';
+  if (proPct >= 100) return 'Protein hit, calories under target. Solid recomp day.';
+  return 'On track — protein close, calories under target.';
 }
 
 /** Slim consumed-vs-target bar for the collapsed Nutrition tile. */

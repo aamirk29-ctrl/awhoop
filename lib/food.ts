@@ -66,6 +66,23 @@ export function addEntry(entry: Omit<FoodEntry, 'id' | 'ts'> & { ts?: number }, 
   saveFoodLog({ ...log, [day]: [...(log[day] || []), full] });
 }
 
+/** Add several entries in one write — logging a preset shouldn't fire a storage
+ *  write (and a cloud-sync push) per item. */
+export function addEntries(
+  entries: (Omit<FoodEntry, 'id' | 'ts'> & { ts?: number })[],
+  day: string = activeDateKey(),
+) {
+  if (entries.length === 0) return;
+  const log = loadFoodLog();
+  const now = Date.now();
+  const full: FoodEntry[] = entries.map((e, i) => ({
+    ...e,
+    id: `${now}-${i}-${Math.random().toString(36).slice(2, 8)}`,
+    ts: e.ts ?? now + i, // keep insertion order stable when sorted by ts
+  }));
+  saveFoodLog({ ...log, [day]: [...(log[day] || []), ...full] });
+}
+
 export function updateEntry(id: string, patch: Partial<FoodEntry>, day: string = activeDateKey()) {
   const log = loadFoodLog();
   const entries = log[day] || [];

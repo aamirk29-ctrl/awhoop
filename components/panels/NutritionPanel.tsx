@@ -28,6 +28,7 @@ import {
 import { useWhoopEnergy } from '@/lib/whoop';
 import { entriesFor, loadFoodLog, progress, totalsFor } from '@/lib/food';
 import FoodLogger from './FoodLogger';
+import MealPresets from './MealPresets';
 import { Card, Eyebrow, Modal, PrimaryButton, Seg, SelectInput, TextInput } from './shared';
 
 const kcal = (n: number) => Math.round(n).toLocaleString();
@@ -242,6 +243,10 @@ export default function NutritionPanel({ accent }: { accent: BentoAccent }) {
           <BurnSplit energy={energy} accent={accent} />
         </Card>
       )}
+
+      {/* Saved meals sit above search: re-logging a known meal is the fast path,
+          and it's what this panel gets opened for most often. */}
+      <MealPresets entries={entries} accent={accent} />
 
       <FoodLogger entries={entries} accent={accent} />
 

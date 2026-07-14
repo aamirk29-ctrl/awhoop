@@ -46,6 +46,7 @@ const CHANNELS: Channel[] = [
       'nutrition_v1',
       'whoop_burn_v1',
       'food_log_v1',
+      'meal_presets_v1',
     ],
     syncedPrefixes: ['stack:taken:'],
   },
