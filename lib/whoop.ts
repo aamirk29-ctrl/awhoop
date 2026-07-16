@@ -286,8 +286,6 @@ export function recordClosedCycles(cycles: any[]): void {
   storeSet(WHOOP_BURN_KEY, next);
 }
 
-/* eslint-enable @typescript-eslint/no-explicit-any */
-
 // ---- shared energy cache ----------------------------------------------------
 // Both the Nutrition panel and the collapsed dashboard card need today's burn.
 // Rather than each mounting its own fetch, the result lands in localStorage and
@@ -342,6 +340,79 @@ export type WhoopEnergyState = {
   error: string | null;
   refresh: () => void;
 };
+
+// ---- workouts for gym cardio/class auto-populate ----------------------------
+// The Gym panel wants to auto-fill cardio/class plan days (runs, sprints,
+// Hyrox, Pilates) from WHOOP instead of manual re-entry. Honesty over
+// cleverness here: WHOOP's exact sport-name vocabulary isn't something this
+// app can verify from the client, so `sportName` is passed through as-is (or
+// null) and matching against a plan activity label is a best-effort
+// *suggestion* the UI presents for confirmation — never a silent auto-log.
+
+export type WhoopWorkout = {
+  id: string;
+  /** Raw sport_name from WHOOP if the API returned one, else null. */
+  sportName: string | null;
+  /** Raw sport_id if that's what the API returned instead. */
+  sportId: number | null;
+  start: string;
+  end: string | null;
+  durationMin: number | null;
+  distanceKm: number | null;
+  strain: number | null;
+};
+
+/** Today's WHOOP workouts (local calendar day), newest first. */
+export async function fetchTodayWhoopWorkouts(): Promise<WhoopWorkout[]> {
+  const res = await whoopFetch<any>('/activity/workout?limit=10').catch(() => null);
+  const records: any[] = Array.isArray(res?.records) ? res.records : [];
+  const todayKey = dateToKey(new Date());
+
+  return records
+    .filter((w) => w?.start && dateToKey(new Date(w.start)) === todayKey)
+    .map((w): WhoopWorkout => {
+      const durationMin =
+        w.end && w.start ? Math.round((Date.parse(w.end) - Date.parse(w.start)) / 60000) : null;
+      const distanceMeter = w.score?.distance_meter ?? w.score?.distanceMeter ?? null;
+      return {
+        id: String(w.id),
+        sportName: typeof w.sport_name === 'string' ? w.sport_name : null,
+        sportId: typeof w.sport_id === 'number' ? w.sport_id : null,
+        start: w.start,
+        end: w.end ?? null,
+        durationMin,
+        distanceKm: typeof distanceMeter === 'number' ? distanceMeter / 1000 : null,
+        strain: w.score?.strain != null ? Number(w.score.strain) : null,
+      };
+    })
+    .sort((a, b) => Date.parse(b.start) - Date.parse(a.start));
+}
+
+/** Loose keyword hints for suggesting which WHOOP workout matches a plan
+ *  activity label — a starting guess for the UI to preselect, not a claim
+ *  about WHOOP's actual enum. The user always confirms before it's logged. */
+const ACTIVITY_HINTS: Record<string, string[]> = {
+  run: ['run', 'jog'],
+  sprints: ['sprint', 'hiit', 'interval'],
+  pilates: ['pilates'],
+  hyrox: ['hyrox', 'functional', 'crossfit'],
+};
+
+/** Best-guess WHOOP workout for a plan activity label, or null if nothing in
+ *  `workouts` looks like a match. Purely a UI default — always surfaced for
+ *  confirmation, never attached automatically. */
+export function suggestWorkoutMatch(workouts: WhoopWorkout[], activityLabel: string): WhoopWorkout | null {
+  const label = activityLabel.trim().toLowerCase();
+  const hints = ACTIVITY_HINTS[label] || [label];
+  return (
+    workouts.find((w) => {
+      const name = w.sportName?.toLowerCase() || '';
+      return hints.some((h) => name.includes(h));
+    }) || null
+  );
+}
+
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 /** Live view of today's WHOOP burn, refetched when the cache goes stale. */
 export function useWhoopEnergy(): WhoopEnergyState {

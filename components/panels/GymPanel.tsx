@@ -6,7 +6,7 @@
 // settings). Same localStorage keys, so logs and sync carry over.
 
 import * as React from 'react';
-import { Pencil, Plus, Settings2, X } from 'lucide-react';
+import { Pencil, Plus, Search, Settings2, X } from 'lucide-react';
 import type { BentoAccent } from '@/components/ui/aurora-bento-grid';
 import { storeGet, storeSet, storeRemove, useStorageTick } from '@/lib/storage';
 import { dateToKey, parseDateKey } from '@/lib/dates';
@@ -16,19 +16,43 @@ import {
   WORKOUT_DONE_KEY,
   WT_KEY,
   estimate1RM,
+  getRecommendations,
   isRestName,
   loadPoState,
   normalizePoState,
   roundToStep,
   todaySplit,
+  type DayConfig,
   type Exercise,
+  type PlanActivity,
   type PoState,
+  type RecommendationGroup,
   type SetLog,
 } from '@/lib/gym';
+import {
+  EQUIPMENT_LABELS,
+  EQUIPMENT_VOCAB,
+  MUSCLE_GROUP_LABELS,
+  MUSCLE_GROUP_MAP,
+  deriveExerciseType,
+  exerciseImageUrl,
+  loadExerciseDb,
+  searchExercises,
+  type DbExercise,
+  type ExerciseType,
+  type MuscleGroupKey,
+} from '@/lib/exercise-db';
+import {
+  fetchTodayWhoopWorkouts,
+  isConnected as isWhoopConnected,
+  suggestWorkoutMatch,
+  type WhoopWorkout,
+} from '@/lib/whoop';
 import { ProgressPhotos } from './gym-photos';
 import {
   Card,
   DangerGhostButton,
+  EmptyState,
   Eyebrow,
   GhostButton,
   Modal,
@@ -49,6 +73,28 @@ function wtLoad(): WtEntry[] {
 const DOWS = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
 const MONS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
 
+/** Builds a loggable Exercise from a DB record, with sensible starter
+ *  rep/weight defaults per type. Shared by the recommendations quick-add and
+ *  the database search modal so both add exercises the same way. */
+function buildExerciseFromDb(rec: DbExercise, gym: string, day: string): Exercise {
+  const type = deriveExerciseType(rec);
+  const defaults =
+    type === 'weighted'
+      ? { repMin: 6, repMax: 10, step: 2.5, startWeight: 20 }
+      : type === 'bodyweight'
+        ? { repMin: 5, repMax: 10, step: 1, startWeight: 0 }
+        : {};
+  return {
+    id: `ex_${Date.now()}_${Math.floor(Math.random() * 9999)}`,
+    name: rec.name,
+    gym,
+    day,
+    type,
+    dbId: rec.id,
+    ...defaults,
+  };
+}
+
 export default function GymPanel({ accent }: { accent: BentoAccent }) {
   const tick = useStorageTick();
   const state = React.useMemo(() => loadPoState(), [tick]);
@@ -58,8 +104,19 @@ export default function GymPanel({ accent }: { accent: BentoAccent }) {
   const [rotOpen, setRotOpen] = React.useState(false);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
   const [exModal, setExModal] = React.useState<{ mode: 'add' | 'edit'; ex?: Exercise } | null>(null);
+  const [dbModalOpen, setDbModalOpen] = React.useState(false);
+  const [db, setDb] = React.useState<DbExercise[]>([]);
+  const [dbError, setDbError] = React.useState<string | null>(null);
 
   const mutate = (patch: Partial<PoState>) => storeSet(PO_KEY, { ...state, ...patch });
+
+  // Load the vendored exercise database once — same-origin static asset, no
+  // GitHub call, cached in lib/exercise-db.ts across mounts.
+  React.useEffect(() => {
+    loadExerciseDb()
+      .then(setDb)
+      .catch((e) => setDbError(e instanceof Error ? e.message : String(e)));
+  }, []);
 
   // Auto-snap the day filter to today's split once (unless the user picked one)
   React.useEffect(() => {
@@ -115,8 +172,10 @@ export default function GymPanel({ accent }: { accent: BentoAccent }) {
         accent={accent}
         doneDays={doneDays}
         mutate={mutate}
+        db={db}
         onAddExercise={() => setExModal({ mode: 'add' })}
         onEditExercise={(ex) => setExModal({ mode: 'edit', ex })}
+        onOpenDb={() => setDbModalOpen(true)}
       />
 
       {/* modals */}
@@ -128,6 +187,19 @@ export default function GymPanel({ accent }: { accent: BentoAccent }) {
           mode={exModal.mode}
           exercise={exModal.ex}
           onClose={() => setExModal(null)}
+        />
+      )}
+      {dbModalOpen && (
+        <ExerciseDbModal
+          db={db}
+          dbError={dbError}
+          state={state}
+          onAdd={(rec) => {
+            const ex = buildExerciseFromDb(rec, state.filterGym, state.filterDay);
+            mutate({ exercises: [...state.exercises, ex], currentEx: ex.id });
+            setDbModalOpen(false);
+          }}
+          onClose={() => setDbModalOpen(false)}
         />
       )}
     </div>
@@ -399,7 +471,8 @@ function computeComposition(state: PoState, entries: WtEntry[]) {
   const workoutDays = new Set<string>();
   state.exercises.forEach((ex) => {
     const logs = state.logs[ex.id] || [];
-    if (logs.length < 2 || ex.bw) {
+    const isStrength = ex.type === 'weighted';
+    if (!isStrength || logs.length < 2) {
       logs.forEach((l) => {
         if (new Date(l.date) >= start) workoutDays.add(l.date.slice(0, 10));
       });
@@ -409,7 +482,7 @@ function computeComposition(state: PoState, entries: WtEntry[]) {
     const before = logs.filter((l) => new Date(l.date) < start);
     inWin.forEach((l) => workoutDays.add(l.date.slice(0, 10)));
     if (!inWin.length || !before.length) return;
-    const avg = (arr: SetLog[]) => arr.reduce((s, l) => s + estimate1RM(l.weight, l.reps), 0) / arr.length;
+    const avg = (arr: SetLog[]) => arr.reduce((s, l) => s + estimate1RM(l.weight || 0, l.reps || 0), 0) / arr.length;
     const a = avg(before);
     if (a <= 0) return;
     strengthRatios.push(avg(inWin) / a);
@@ -490,12 +563,16 @@ type Rx = {
 function getRx(ex: Exercise, logs: SetLog[], unit: string): Rx | null {
   if (!logs.length) return null;
   const last = logs[logs.length - 1];
-  const { weight, reps } = last;
-  const { repMin, repMax, step, bw } = ex;
+  const weight = last.weight ?? 0;
+  const reps = last.reps ?? 0;
+  const repMin = ex.repMin ?? 1;
+  const repMax = ex.repMax ?? repMin;
+  const step = ex.step ?? 2.5;
+  const bw = ex.type === 'bodyweight';
   const upgradeAt = Math.min(GYM_CONFIG.upgradeAtReps || 8, repMax);
   let stuck = 0;
   for (let i = logs.length - 1; i >= 0; i--) {
-    if (logs[i].weight === weight) stuck++;
+    if ((logs[i].weight ?? 0) === weight) stuck++;
     else break;
   }
   if (bw) {
@@ -521,15 +598,19 @@ function CoachCard({
   accent,
   doneDays,
   mutate,
+  db,
   onAddExercise,
   onEditExercise,
+  onOpenDb,
 }: {
   state: PoState;
   accent: BentoAccent;
   doneDays: Record<string, string>;
   mutate: (patch: Partial<PoState>) => void;
+  db: DbExercise[];
   onAddExercise: () => void;
   onEditExercise: (ex: Exercise) => void;
+  onOpenDb: () => void;
 }) {
   const unit = state.units;
   const filtered = state.exercises.filter(
@@ -537,33 +618,80 @@ function CoachCard({
   );
   const current = filtered.find((e) => e.id === state.currentEx) || filtered[0] || null;
   const logs: SetLog[] = current ? (state.logs[current.id] || []).slice() : [];
+  const isWeighted = current?.type === 'weighted';
+  const isBodyweight = current?.type === 'bodyweight';
+  const isCardio = current?.type === 'cardio';
+  const isClass = current?.type === 'class';
 
   const [weightInput, setWeightInput] = React.useState('');
   const [repsSel, setRepsSel] = React.useState<number | null>(null);
+  const [distanceInput, setDistanceInput] = React.useState('');
+  const [durationInput, setDurationInput] = React.useState('');
   const [pastOpen, setPastOpen] = React.useState(false);
 
   // pre-fill weight when exercise changes
   React.useEffect(() => {
-    if (current && !current.bw) {
-      const w = logs.length ? logs[logs.length - 1].weight : current.startWeight || 0;
+    if (current && current.type === 'weighted') {
+      const w = logs.length ? logs[logs.length - 1].weight ?? 0 : current.startWeight || 0;
       setWeightInput(String(w));
+    } else {
+      setWeightInput('');
     }
     setRepsSel(null);
+    setDistanceInput('');
+    setDurationInput('');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current?.id]);
 
-  // rep pills range
+  // rep pills range (weighted / bodyweight only)
   const repMin = current ? Math.max(1, current.repMin || 1) : 4;
   const repMax = current ? Math.max(repMin, current.repMax || repMin) : 12;
   const repEnd = Math.min(Math.max(repMax + 2, repMin + 5), repMin + 15);
   const activeRep = repsSel != null && repsSel >= repMin && repsSel <= repEnd ? repsSel : repMax;
 
+  // WHOOP suggestion for the current cardio/class exercise
+  const [whoopWorkouts, setWhoopWorkouts] = React.useState<WhoopWorkout[]>([]);
+  React.useEffect(() => {
+    setWhoopWorkouts([]);
+    if (!current || (current.type !== 'cardio' && current.type !== 'class') || !isWhoopConnected()) return;
+    let cancelled = false;
+    fetchTodayWhoopWorkouts()
+      .then((w) => {
+        if (!cancelled) setWhoopWorkouts(w);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [current?.id, current?.type]);
+  const whoopSuggestion = current ? suggestWorkoutMatch(whoopWorkouts, current.name) : null;
+
   const logSet = () => {
     if (!current) return;
+    if (current.type === 'cardio') {
+      const distanceKm = parseFloat(distanceInput) || 0;
+      const durationMin = parseFloat(durationInput) || 0;
+      if (distanceKm <= 0 && durationMin <= 0) {
+        alert('Enter a distance or duration.');
+        return;
+      }
+      const arr = (state.logs[current.id] || []).slice();
+      arr.push({ date: new Date().toISOString(), distanceKm, durationMin, source: 'manual' });
+      mutate({ logs: { ...state.logs, [current.id]: arr }, currentEx: current.id });
+      setDistanceInput('');
+      setDurationInput('');
+      return;
+    }
+    if (current.type === 'class') {
+      const arr = (state.logs[current.id] || []).slice();
+      arr.push({ date: new Date().toISOString(), attended: true, source: 'manual' });
+      mutate({ logs: { ...state.logs, [current.id]: arr }, currentEx: current.id });
+      return;
+    }
     const reps = activeRep;
     if (reps <= 0) return;
-    const w = current.bw ? 0 : parseFloat(weightInput) || 0;
-    if (!current.bw && w <= 0) {
+    const w = current.type === 'bodyweight' ? parseFloat(weightInput) || 0 : parseFloat(weightInput) || 0;
+    if (current.type === 'weighted' && w <= 0) {
       alert('Enter a weight.');
       return;
     }
@@ -572,23 +700,62 @@ function CoachCard({
     mutate({ logs: { ...state.logs, [current.id]: arr }, currentEx: current.id });
   };
 
-  const rx = current ? getRx(current, logs, unit) : null;
+  const logFromWhoop = (w: WhoopWorkout) => {
+    if (!current) return;
+    const arr = (state.logs[current.id] || []).slice();
+    if (current.type === 'cardio') {
+      arr.push({
+        date: w.start,
+        distanceKm: w.distanceKm ?? 0,
+        durationMin: w.durationMin ?? 0,
+        source: 'whoop',
+        whoopWorkoutId: w.id,
+      });
+    } else {
+      arr.push({ date: w.start, attended: true, source: 'whoop', whoopWorkoutId: w.id });
+    }
+    mutate({ logs: { ...state.logs, [current.id]: arr }, currentEx: current.id });
+  };
+
+  const rx = current && (isWeighted || isBodyweight) ? getRx(current, logs, unit) : null;
   const lastLog = logs[logs.length - 1];
 
   // stats
   let oneRm = '—';
   let bestSet = '—';
+  let totalDistance = 0;
+  let totalDuration = 0;
   if (current && logs.length) {
-    if (current.bw) oneRm = `${Math.max(...logs.map((l) => l.reps))}`;
-    else oneRm = String(Math.round(Math.max(...logs.map((l) => estimate1RM(l.weight, l.reps)))));
-    let best = logs[0];
-    logs.forEach((l) => {
-      const cur = current.bw ? l.reps : estimate1RM(l.weight, l.reps);
-      const bestVal = current.bw ? best.reps : estimate1RM(best.weight, best.reps);
-      if (cur > bestVal) best = l;
-    });
-    bestSet = current.bw ? `${best.reps}r` : `${best.weight}×${best.reps}`;
+    if (isCardio) {
+      totalDistance = logs.reduce((s, l) => s + (l.distanceKm || 0), 0);
+      totalDuration = logs.reduce((s, l) => s + (l.durationMin || 0), 0);
+    } else if (isBodyweight) {
+      oneRm = `${Math.max(...logs.map((l) => l.reps || 0))}`;
+    } else if (isWeighted) {
+      oneRm = String(Math.round(Math.max(...logs.map((l) => estimate1RM(l.weight || 0, l.reps || 0)))));
+    }
+    if (isWeighted || isBodyweight) {
+      let best = logs[0];
+      logs.forEach((l) => {
+        const cur = isBodyweight ? l.reps || 0 : estimate1RM(l.weight || 0, l.reps || 0);
+        const bestVal = isBodyweight ? best.reps || 0 : estimate1RM(best.weight || 0, best.reps || 0);
+        if (cur > bestVal) best = l;
+      });
+      bestSet = isBodyweight ? `${best.reps}r` : `${best.weight}×${best.reps}`;
+    }
   }
+
+  // recommendations for the filtered day
+  const dayConfig = state.days.find((d) => d.id === state.filterDay);
+  const recGroups = React.useMemo(
+    () => (dayConfig && db.length ? getRecommendations(state, db, dayConfig) : []),
+    [state, db, dayConfig],
+  );
+
+  const quickAddFromDb = (rec: DbExercise) => {
+    const ex = buildExerciseFromDb(rec, state.filterGym, state.filterDay);
+    mutate({ exercises: [...state.exercises, ex], currentEx: ex.id });
+  };
 
   // today's + past workouts
   const byDay: Record<string, { ex: Exercise; log: SetLog }[]> = {};
@@ -613,8 +780,18 @@ function CoachCard({
     storeSet(WORKOUT_DONE_KEY, next);
   };
 
-  const trendLogs = logs.slice(-10);
-  const trendVals = current ? trendLogs.map((l) => (current.bw ? l.reps : estimate1RM(l.weight, l.reps))) : [];
+  const trendVals = React.useMemo(() => {
+    if (!current) return [];
+    const trendLogs = logs.slice(-10);
+    if (isBodyweight) return trendLogs.map((l) => l.reps || 0);
+    if (isWeighted) return trendLogs.map((l) => estimate1RM(l.weight || 0, l.reps || 0));
+    if (isCardio) {
+      return trendLogs
+        .filter((l) => (l.distanceKm || 0) > 0 && (l.durationMin || 0) > 0)
+        .map((l) => (l.durationMin as number) / (l.distanceKm as number)); // min/km — lower is faster
+    }
+    return [];
+  }, [current, logs, isBodyweight, isWeighted, isCardio]);
 
   return (
     <Card>
@@ -653,7 +830,15 @@ function CoachCard({
             filtered.map((e) => (
               <option key={e.id} value={e.id}>
                 {e.name}
-                {e.bw ? ' · BW' : e.startWeight ? ` · ${e.startWeight}${unit}` : ''}
+                {e.type === 'bodyweight'
+                  ? ' · BW'
+                  : e.type === 'cardio'
+                    ? ' · Cardio'
+                    : e.type === 'class'
+                      ? ' · Class'
+                      : e.startWeight
+                        ? ` · ${e.startWeight}${unit}`
+                        : ''}
                 {e.gym === 'both' ? ' ★' : ''}
               </option>
             ))
@@ -661,6 +846,9 @@ function CoachCard({
             <option>—</option>
           )}
         </SelectInput>
+        <IconBtn onClick={onOpenDb} label="Browse exercise database">
+          <Search size={15} aria-hidden />
+        </IconBtn>
         <IconBtn onClick={onAddExercise} label="Add exercise">
           <Plus size={17} aria-hidden />
         </IconBtn>
@@ -670,120 +858,271 @@ function CoachCard({
       </div>
       {!filtered.length && (
         <div className="mt-2.5 rounded-xl border border-dashed border-white/[0.07] bg-white/[0.025] p-4 text-center text-[13px] text-ink-3">
-          No exercises here yet. Tap <strong>+</strong> to add one.
+          No exercises here yet. Tap <strong>+</strong> to add one, or search the database.
         </div>
       )}
 
+      {/* recommendations */}
+      {recGroups.some((g) => g.exercises.length > 0) && (
+        <>
+          <SubTitle className="mt-5">Today's recommendations</SubTitle>
+          <div className="flex flex-col gap-3">
+            {recGroups
+              .filter((g) => g.exercises.length > 0)
+              .map((g) => (
+                <div key={g.key}>
+                  <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[0.12em] text-ink-3">
+                    {MUSCLE_GROUP_LABELS[g.key as MuscleGroupKey] || g.label}
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    {g.exercises.map((rec) => (
+                      <button
+                        key={rec.id}
+                        type="button"
+                        onClick={() => quickAddFromDb(rec)}
+                        className="flex cursor-pointer items-center justify-between gap-2 rounded-[10px] border border-white/[0.07] bg-white/[0.025] px-3 py-2.5 text-left text-[13px] transition-colors hover:border-white/[0.14] hover:bg-white/[0.05]"
+                      >
+                        <span className="min-w-0 truncate font-semibold text-ink">{rec.name}</span>
+                        <span className="shrink-0 rounded-full bg-white/[0.06] px-2 py-1 text-[10px] font-bold uppercase tracking-[0.06em] text-ink-3">
+                          + Add
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+          </div>
+        </>
+      )}
+
       {/* log form */}
-      <SubTitle className="mt-5">Log today's top set</SubTitle>
-      {current?.bw && (
+      <SubTitle className="mt-5">Log {isCardio ? "today's session" : isClass ? 'attendance' : "today's top set"}</SubTitle>
+      {isBodyweight && (
         <div className="mb-3 rounded-lg border border-white/[0.07] bg-white/[0.04] py-2 text-center text-[11px] font-bold uppercase tracking-[0.1em] text-ink-2">
-          Bodyweight — log reps only
+          Bodyweight — reps, with optional added {unit}
         </div>
       )}
-      {current && lastLog && (
+
+      {(isCardio || isClass) && whoopSuggestion && (
+        <div className="mb-3 rounded-[10px] border border-good/[0.18] bg-good/[0.06] px-3.5 py-3 text-[12px]">
+          <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.1em] text-good">
+            Found on WHOOP
+          </div>
+          <div className="mb-2 text-ink">
+            {whoopSuggestion.sportName || 'Workout'}
+            {whoopSuggestion.durationMin ? ` · ${whoopSuggestion.durationMin} min` : ''}
+            {whoopSuggestion.distanceKm ? ` · ${whoopSuggestion.distanceKm.toFixed(1)} km` : ''}
+          </div>
+          <button
+            type="button"
+            onClick={() => logFromWhoop(whoopSuggestion)}
+            className="cursor-pointer rounded-lg bg-good/[0.16] px-3 py-1.5 text-[12px] font-bold text-good"
+          >
+            Log from WHOOP
+          </button>
+        </div>
+      )}
+      {(isCardio || isClass) && !whoopSuggestion && whoopWorkouts.length > 0 && (
+        <div className="mb-3 flex flex-col gap-1.5">
+          <div className="text-[10px] font-bold uppercase tracking-[0.1em] text-ink-3">Today's WHOOP workouts</div>
+          {whoopWorkouts.map((w) => (
+            <button
+              key={w.id}
+              type="button"
+              onClick={() => logFromWhoop(w)}
+              className="cursor-pointer rounded-lg border border-white/[0.07] bg-white/[0.025] px-3 py-2 text-left text-[12px] text-ink-2 hover:bg-white/[0.05]"
+            >
+              {w.sportName || 'Workout'}
+              {w.durationMin ? ` · ${w.durationMin} min` : ''}
+              {w.distanceKm ? ` · ${w.distanceKm.toFixed(1)} km` : ''} — tap to log
+            </button>
+          ))}
+        </div>
+      )}
+
+      {current && lastLog && (isWeighted || isBodyweight) && (
         <div className="mb-3 flex items-center gap-3 rounded-[10px] border border-white/[0.07] bg-white/[0.025] px-3.5 py-2.5 text-[12px]">
           <span className="text-[10px] font-bold uppercase tracking-[0.1em] text-ink-3">Last time</span>
           <span className="font-bold tabular-nums text-ink">
-            {current.bw ? `${lastLog.reps} reps` : `${lastLog.weight}${unit} × ${lastLog.reps}`}
+            {isBodyweight ? `${lastLog.reps} reps` : `${lastLog.weight}${unit} × ${lastLog.reps}`}
           </span>
           <span className="ml-auto font-mono text-[11px] text-ink-3">{agoLabel(lastLog.date)}</span>
         </div>
       )}
-      <div className={`mb-3.5 grid gap-2.5 ${current?.bw ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-2'}`}>
-        {!current?.bw && (
-          <div className="flex flex-col gap-2">
-            <FieldLabel>Weight ({unit})</FieldLabel>
-            <div className="grid grid-cols-[auto_1fr_auto] items-stretch gap-1.5">
-              <WBtn onClick={() => setWeightInput(String(Math.max(0, (parseFloat(weightInput) || 0) - (current?.step || 2.5))))}>−</WBtn>
+
+      {isClass ? (
+        <PrimaryButton onClick={logSet} disabled={!current} className="w-full py-3.5">
+          Mark attended
+        </PrimaryButton>
+      ) : isCardio ? (
+        <>
+          <div className="mb-3.5 grid grid-cols-2 gap-2.5">
+            <div className="flex flex-col gap-2">
+              <FieldLabel>Distance (km)</FieldLabel>
               <input
                 type="number"
-                step="0.5"
+                step="0.1"
                 inputMode="decimal"
                 placeholder="0"
-                value={weightInput}
-                onChange={(e) => setWeightInput(e.target.value)}
-                className="min-w-0 rounded-xl border border-white/[0.07] bg-black/30 px-3 py-3 text-center font-mono text-[22px] font-bold text-ink tabular-nums outline-none focus:border-white/40"
+                value={distanceInput}
+                onChange={(e) => setDistanceInput(e.target.value)}
+                className="min-w-0 rounded-xl border border-white/[0.07] bg-black/30 px-3 py-3 text-center font-mono text-[20px] font-bold text-ink tabular-nums outline-none focus:border-white/40"
               />
-              <WBtn onClick={() => setWeightInput(String((parseFloat(weightInput) || 0) + (current?.step || 2.5)))}>+</WBtn>
+            </div>
+            <div className="flex flex-col gap-2">
+              <FieldLabel>Duration (min)</FieldLabel>
+              <input
+                type="number"
+                step="1"
+                inputMode="decimal"
+                placeholder="0"
+                value={durationInput}
+                onChange={(e) => setDurationInput(e.target.value)}
+                className="min-w-0 rounded-xl border border-white/[0.07] bg-black/30 px-3 py-3 text-center font-mono text-[20px] font-bold text-ink tabular-nums outline-none focus:border-white/40"
+              />
             </div>
           </div>
-        )}
-        <div className="flex flex-col gap-2">
-          <FieldLabel>Reps</FieldLabel>
-          <div className="grid grid-cols-4 gap-1.5 sm:grid-cols-[repeat(auto-fit,minmax(44px,1fr))]">
-            {Array.from({ length: repEnd - repMin + 1 }, (_, i) => repMin + i).map((r) => (
-              <button
-                key={r}
-                type="button"
-                onClick={() => setRepsSel(r)}
-                className={`cursor-pointer rounded-lg border py-3 font-mono text-[13px] font-semibold tabular-nums transition-colors ${
-                  r === activeRep
-                    ? 'border-transparent bg-gradient-to-b from-white to-[#e8e5dd] font-extrabold text-[#0a0a0b]'
-                    : 'border-white/[0.07] bg-black/30 text-ink-2 hover:bg-white/[0.06] hover:text-ink'
-                }`}
-              >
-                {r}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-      <PrimaryButton onClick={logSet} disabled={!current} className="w-full py-3.5">
-        Log set
-      </PrimaryButton>
-
-      {/* prescription */}
-      <SubTitle className="mt-5">Next session</SubTitle>
-      {!current ? (
-        <div className="py-4 text-center text-[13px] text-ink-3">Pick a gym and day above.</div>
-      ) : rx ? (
-        <RxCard rx={rx} name={current.name} unit={unit} />
+          <PrimaryButton onClick={logSet} disabled={!current} className="w-full py-3.5">
+            Log session
+          </PrimaryButton>
+        </>
       ) : (
-        <div className="rounded-[14px] border border-white/[0.07] bg-white/[0.025] px-5 py-4">
-          <div className="mb-1.5 text-[10.5px] font-bold uppercase tracking-[0.1em] text-ink-3">
-            {current.name} · starting point
-          </div>
-          <div className="mb-2.5 text-[24px] font-bold leading-tight">
-            {current.bw ? (
-              <>
-                <span className="text-ink">{current.repMin}</span> reps
-              </>
+        <>
+          <div className={`mb-3.5 grid gap-2.5 ${isBodyweight ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-2'}`}>
+            {!isBodyweight ? (
+              <div className="flex flex-col gap-2">
+                <FieldLabel>Weight ({unit})</FieldLabel>
+                <div className="grid grid-cols-[auto_1fr_auto] items-stretch gap-1.5">
+                  <WBtn onClick={() => setWeightInput(String(Math.max(0, (parseFloat(weightInput) || 0) - (current?.step || 2.5))))}>−</WBtn>
+                  <input
+                    type="number"
+                    step="0.5"
+                    inputMode="decimal"
+                    placeholder="0"
+                    value={weightInput}
+                    onChange={(e) => setWeightInput(e.target.value)}
+                    className="min-w-0 rounded-xl border border-white/[0.07] bg-black/30 px-3 py-3 text-center font-mono text-[22px] font-bold text-ink tabular-nums outline-none focus:border-white/40"
+                  />
+                  <WBtn onClick={() => setWeightInput(String((parseFloat(weightInput) || 0) + (current?.step || 2.5)))}>+</WBtn>
+                </div>
+              </div>
             ) : (
-              <>
-                <span className="text-ink">
-                  {current.startWeight || 0}
-                  {unit}
-                </span>{' '}
-                × {current.repMin} reps
-              </>
+              <div className="flex flex-col gap-2">
+                <FieldLabel>Added weight ({unit}, optional)</FieldLabel>
+                <div className="grid grid-cols-[auto_1fr_auto] items-stretch gap-1.5">
+                  <WBtn onClick={() => setWeightInput(String(Math.max(0, (parseFloat(weightInput) || 0) - (current?.step || 1))))}>−</WBtn>
+                  <input
+                    type="number"
+                    step="0.5"
+                    inputMode="decimal"
+                    placeholder="0"
+                    value={weightInput}
+                    onChange={(e) => setWeightInput(e.target.value)}
+                    className="min-w-0 rounded-xl border border-white/[0.07] bg-black/30 px-3 py-3 text-center font-mono text-[22px] font-bold text-ink tabular-nums outline-none focus:border-white/40"
+                  />
+                  <WBtn onClick={() => setWeightInput(String((parseFloat(weightInput) || 0) + (current?.step || 1)))}>+</WBtn>
+                </div>
+              </div>
             )}
+            <div className="flex flex-col gap-2">
+              <FieldLabel>Reps</FieldLabel>
+              <div className="grid grid-cols-4 gap-1.5 sm:grid-cols-[repeat(auto-fit,minmax(44px,1fr))]">
+                {Array.from({ length: repEnd - repMin + 1 }, (_, i) => repMin + i).map((r) => (
+                  <button
+                    key={r}
+                    type="button"
+                    onClick={() => setRepsSel(r)}
+                    className={`cursor-pointer rounded-lg border py-3 font-mono text-[13px] font-semibold tabular-nums transition-colors ${
+                      r === activeRep
+                        ? 'border-transparent bg-gradient-to-b from-white to-[#e8e5dd] font-extrabold text-[#0a0a0b]'
+                        : 'border-white/[0.07] bg-black/30 text-ink-2 hover:bg-white/[0.06] hover:text-ink'
+                    }`}
+                  >
+                    {r}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
-          <span className="mb-2.5 inline-block rounded-full bg-warn/[0.14] px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.08em] text-warn">
-            Start here
-          </span>
-          <p className="m-0 text-[13px] leading-normal text-ink-2">
-            {current.bw
-              ? `Aim for ${current.repMin}-${current.repMax} clean reps. Once you hit ${current.repMax}+, push for more.`
-              : `Hit ${current.repMin}-${current.repMax} reps. Once logged, the coach will start prescribing.`}
-          </p>
-        </div>
+          <PrimaryButton onClick={logSet} disabled={!current} className="w-full py-3.5">
+            Log set
+          </PrimaryButton>
+        </>
+      )}
+
+      {/* prescription (weighted / bodyweight only) */}
+      {(isWeighted || isBodyweight) && (
+        <>
+          <SubTitle className="mt-5">Next session</SubTitle>
+          {!current ? (
+            <div className="py-4 text-center text-[13px] text-ink-3">Pick a gym and day above.</div>
+          ) : rx ? (
+            <RxCard rx={rx} name={current.name} unit={unit} />
+          ) : (
+            <div className="rounded-[14px] border border-white/[0.07] bg-white/[0.025] px-5 py-4">
+              <div className="mb-1.5 text-[10.5px] font-bold uppercase tracking-[0.1em] text-ink-3">
+                {current.name} · starting point
+              </div>
+              <div className="mb-2.5 text-[24px] font-bold leading-tight">
+                {isBodyweight ? (
+                  <>
+                    <span className="text-ink">{current.repMin}</span> reps
+                  </>
+                ) : (
+                  <>
+                    <span className="text-ink">
+                      {current.startWeight || 0}
+                      {unit}
+                    </span>{' '}
+                    × {current.repMin} reps
+                  </>
+                )}
+              </div>
+              <span className="mb-2.5 inline-block rounded-full bg-warn/[0.14] px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.08em] text-warn">
+                Start here
+              </span>
+              <p className="m-0 text-[13px] leading-normal text-ink-2">
+                {isBodyweight
+                  ? `Aim for ${current.repMin}-${current.repMax} clean reps. Once you hit ${current.repMax}+, push for more.`
+                  : `Hit ${current.repMin}-${current.repMax} reps. Once logged, the coach will start prescribing.`}
+              </p>
+            </div>
+          )}
+        </>
       )}
 
       {/* stats */}
       <SubTitle className="mt-5">Stats</SubTitle>
       <div className="grid grid-cols-3 gap-2">
-        <StatBox label={current?.bw ? 'Best reps' : 'Est. 1RM'} value={oneRm} unit={current?.bw ? 'reps' : unit} />
-        <StatBox label="Best set" value={bestSet} />
-        <StatBox label="Sessions" value={logs.length ? String(logs.length) : '—'} />
+        {isCardio ? (
+          <>
+            <StatBox label="Total distance" value={totalDistance ? totalDistance.toFixed(1) : '—'} unit="km" />
+            <StatBox label="Total time" value={totalDuration ? String(Math.round(totalDuration)) : '—'} unit="min" />
+            <StatBox label="Sessions" value={logs.length ? String(logs.length) : '—'} />
+          </>
+        ) : isClass ? (
+          <StatBox label="Sessions attended" value={logs.length ? String(logs.length) : '—'} />
+        ) : (
+          <>
+            <StatBox label={isBodyweight ? 'Best reps' : 'Est. 1RM'} value={oneRm} unit={isBodyweight ? 'reps' : unit} />
+            <StatBox label="Best set" value={bestSet} />
+            <StatBox label="Sessions" value={logs.length ? String(logs.length) : '—'} />
+          </>
+        )}
       </div>
 
       {/* trend */}
-      <SubTitle className="mt-5">Trend (last 10 sessions)</SubTitle>
-      {trendVals.length < 2 ? (
-        <div className="py-4 text-center text-[11px] text-ink-3">Need 2+ sessions for trend</div>
-      ) : (
-        <TrendSpark vals={trendVals} accent={accent.from} />
+      {!isClass && (
+        <>
+          <SubTitle className="mt-5">
+            {isCardio ? 'Pace trend (last 10 sessions)' : 'Trend (last 10 sessions)'}
+          </SubTitle>
+          {trendVals.length < 2 ? (
+            <div className="py-4 text-center text-[11px] text-ink-3">Need 2+ sessions for trend</div>
+          ) : (
+            <TrendSpark vals={trendVals} accent={accent.from} />
+          )}
+        </>
       )}
 
       {/* history */}
@@ -805,7 +1144,18 @@ function CoachCard({
               >
                 <span className="font-mono text-[11px] text-ink-3">{`${dt.getMonth() + 1}/${dt.getDate()}`}</span>
                 <span className="text-[14px] font-bold tabular-nums text-ink">
-                  {current?.bw ? `${l.reps} reps` : `${l.weight}${unit} × ${l.reps}`}
+                  {isCardio
+                    ? `${l.distanceKm ? `${l.distanceKm.toFixed(1)}km` : ''}${l.distanceKm && l.durationMin ? ' · ' : ''}${l.durationMin ? `${l.durationMin}min` : ''}`
+                    : isClass
+                      ? 'Attended'
+                      : isBodyweight
+                        ? `${l.reps} reps${l.weight ? ` · +${l.weight}${unit}` : ''}`
+                        : `${l.weight}${unit} × ${l.reps}`}
+                  {l.source === 'whoop' && (
+                    <span className="ml-1.5 rounded-full bg-white/[0.06] px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.06em] text-ink-3">
+                      WHOOP
+                    </span>
+                  )}
                 </span>
                 <button
                   type="button"
@@ -864,23 +1214,17 @@ function CoachCard({
           </div>
         ) : (
           <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
-            {todaySum.perEx.map((e) => {
-              const top = e.ex.bw
-                ? `top ${Math.max(...e.sets.map((s) => s.reps))} reps`
-                : `top ${Math.max(...e.sets.map((s) => s.weight))}${unit}`;
-              const meta = e.ex.bw
-                ? `${e.sets.length} set${e.sets.length === 1 ? '' : 's'} · ${top}`
-                : `${e.sets.length} set${e.sets.length === 1 ? '' : 's'} · ${top} · ${Math.round(e.vol)}${unit} total`;
-              return (
-                <li
-                  key={e.ex.id}
-                  className="flex items-center justify-between gap-2 rounded-[10px] border border-white/[0.07] bg-white/[0.025] px-3 py-2.5 text-[13px]"
-                >
-                  <span className="min-w-0 break-words font-semibold text-ink">{e.ex.name}</span>
-                  <span className="font-mono text-[11px] tabular-nums text-ink-3">{meta}</span>
-                </li>
-              );
-            })}
+            {todaySum.perEx.map((e) => (
+              <li
+                key={e.ex.id}
+                className="flex items-center justify-between gap-2 rounded-[10px] border border-white/[0.07] bg-white/[0.025] px-3 py-2.5 text-[13px]"
+              >
+                <span className="min-w-0 break-words font-semibold text-ink">{e.ex.name}</span>
+                <span className="font-mono text-[11px] tabular-nums text-ink-3">
+                  {summarizeExerciseSets(e.ex, e.sets, unit)}
+                </span>
+              </li>
+            ))}
           </ul>
         )}
       </div>
@@ -943,7 +1287,9 @@ function summarizeDay(daySets: { ex: Exercise; log: SetLog }[]) {
   daySets.forEach(({ ex, log }) => {
     (byEx[ex.id] ||= { ex, sets: [], vol: 0 });
     byEx[ex.id].sets.push(log);
-    byEx[ex.id].vol += (log.weight || 0) * (log.reps || 0);
+    if (ex.type === 'weighted' || ex.type === 'bodyweight') {
+      byEx[ex.id].vol += (log.weight || 0) * (log.reps || 0);
+    }
   });
   const perEx = Object.values(byEx);
   return {
@@ -951,6 +1297,28 @@ function summarizeDay(daySets: { ex: Exercise; log: SetLog }[]) {
     totalSets: perEx.reduce((s, e) => s + e.sets.length, 0),
     totalVol: perEx.reduce((s, e) => s + e.vol, 0),
   };
+}
+
+/** One-line summary of a day's sets for an exercise, branched by type. */
+function summarizeExerciseSets(ex: Exercise, sets: SetLog[], unit: string): string {
+  const n = sets.length;
+  const count = `${n} ${ex.type === 'cardio' || ex.type === 'class' ? 'session' : 'set'}${n === 1 ? '' : 's'}`;
+  if (ex.type === 'cardio') {
+    const km = sets.reduce((s, l) => s + (l.distanceKm || 0), 0);
+    const min = sets.reduce((s, l) => s + (l.durationMin || 0), 0);
+    const parts = [count];
+    if (km > 0) parts.push(`${km.toFixed(1)}km`);
+    if (min > 0) parts.push(`${Math.round(min)}min`);
+    return parts.join(' · ');
+  }
+  if (ex.type === 'class') return count;
+  if (ex.type === 'bodyweight') {
+    const top = Math.max(...sets.map((s) => s.reps || 0));
+    return `${count} · top ${top} reps`;
+  }
+  const top = Math.max(...sets.map((s) => s.weight || 0));
+  const vol = sets.reduce((s, l) => s + (l.weight || 0) * (l.reps || 0), 0);
+  return `${count} · top ${top}${unit} · ${Math.round(vol)}${unit} total`;
 }
 
 function agoLabel(dateIso: string): string {
@@ -1089,6 +1457,12 @@ function RotationModal({ state, onClose }: { state: PoState; onClose: () => void
     const i = todaySplit(state).index;
     return i < draft.length ? i : 0;
   });
+  const [dayDrafts, setDayDrafts] = React.useState<DayConfig[]>(() => state.days.map((d) => ({ ...d })));
+  const [expanded, setExpanded] = React.useState<number | null>(null);
+
+  const findDay = (name: string) => dayDrafts.find((d) => d.name.toLowerCase() === name.toLowerCase());
+  const updateDay = (id: string, patch: Partial<DayConfig>) =>
+    setDayDrafts(dayDrafts.map((d) => (d.id === id ? { ...d, ...patch } : d)));
 
   const save = () => {
     const cleaned = draft.map((s) => (s || '').trim()).filter(Boolean);
@@ -1100,91 +1474,169 @@ function RotationModal({ state, onClose }: { state: PoState; onClose: () => void
       ...loadPoState(),
       splitRotation: cleaned,
       splitAnchor: { date: new Date().toISOString().slice(0, 10), index: todayIdx >= cleaned.length ? 0 : todayIdx },
+      days: dayDrafts,
     });
     onClose();
   };
 
   return (
-    <Modal open onClose={onClose} title="Edit split rotation">
+    <Modal open onClose={onClose} title="Edit split rotation" maxWidth={540}>
       <p className="-mt-1.5 mb-3.5 text-[12px] leading-normal text-ink-3">
         Days cycle in this order, repeating forever. Today is whichever entry is highlighted. Use{' '}
-        <strong>Today is →</strong> to jump the cycle to a different starting day.
+        <strong>Today is →</strong> to jump the cycle to a different starting day. Tap <strong>Plan</strong> to edit
+        a day's muscle groups, cardio/class blocks, and pinned exercises.
       </p>
       <div className="mb-2 flex flex-col gap-1.5">
-        {draft.map((name, i) => (
-          <div
-            key={i}
-            className={`grid grid-cols-[auto_1fr_auto_auto_auto_auto] items-center gap-1.5 rounded-lg border px-2.5 py-2 ${
-              i === todayIdx
-                ? 'border-good/30 bg-gradient-to-b from-good/10 to-white/[0.025]'
-                : 'border-white/[0.07] bg-white/[0.025]'
-            }`}
-          >
-            <span className="w-[18px] text-center font-mono text-[11px] font-bold text-ink-3">{i + 1}</span>
-            <input
-              value={name}
-              maxLength={30}
-              placeholder="e.g. Arms"
-              onChange={(e) => setDraft(draft.map((x, j) => (j === i ? e.target.value : x)))}
-              className="min-w-0 bg-transparent py-1 text-[13px] text-ink outline-none"
-            />
-            {i === todayIdx ? (
-              <span className="rounded-full bg-good/[0.16] px-1.5 py-0.5 text-[8px] font-extrabold tracking-[0.1em] text-good">
-                TODAY
-              </span>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setTodayIdx(i)}
-                className="cursor-pointer rounded-full border border-white/[0.07] bg-white/[0.04] px-2 py-1 text-[9px] font-bold uppercase tracking-[0.06em] text-ink-3 hover:border-good/30 hover:text-good"
+        {draft.map((name, i) => {
+          const matchedDay = findDay(name);
+          return (
+            <div key={i}>
+              <div
+                className={`grid grid-cols-[auto_1fr_auto_auto_auto_auto_auto] items-center gap-1.5 rounded-lg border px-2.5 py-2 ${
+                  i === todayIdx
+                    ? 'border-good/30 bg-gradient-to-b from-good/10 to-white/[0.025]'
+                    : 'border-white/[0.07] bg-white/[0.025]'
+                }`}
               >
-                Today is →
-              </button>
-            )}
-            <MiniBtn
-              label="Move up"
-              onClick={() => {
-                if (i === 0) return;
-                const next = draft.slice();
-                [next[i - 1], next[i]] = [next[i], next[i - 1]];
-                setDraft(next);
-                if (todayIdx === i) setTodayIdx(i - 1);
-                else if (todayIdx === i - 1) setTodayIdx(i);
-              }}
-            >
-              ↑
-            </MiniBtn>
-            <MiniBtn
-              label="Move down"
-              onClick={() => {
-                if (i >= draft.length - 1) return;
-                const next = draft.slice();
-                [next[i + 1], next[i]] = [next[i], next[i + 1]];
-                setDraft(next);
-                if (todayIdx === i) setTodayIdx(i + 1);
-                else if (todayIdx === i + 1) setTodayIdx(i);
-              }}
-            >
-              ↓
-            </MiniBtn>
-            <MiniBtn
-              label="Delete"
-              danger
-              onClick={() => {
-                if (draft.length <= 1) {
-                  alert('Need at least one day in the cycle.');
-                  return;
-                }
-                const next = draft.filter((_, j) => j !== i);
-                setDraft(next);
-                if (todayIdx >= next.length) setTodayIdx(next.length - 1);
-                else if (i < todayIdx) setTodayIdx(todayIdx - 1);
-              }}
-            >
-              ×
-            </MiniBtn>
-          </div>
-        ))}
+                <span className="w-[18px] text-center font-mono text-[11px] font-bold text-ink-3">{i + 1}</span>
+                <input
+                  value={name}
+                  maxLength={30}
+                  placeholder="e.g. Arms"
+                  onChange={(e) => setDraft(draft.map((x, j) => (j === i ? e.target.value : x)))}
+                  className="min-w-0 bg-transparent py-1 text-[13px] text-ink outline-none"
+                />
+                {i === todayIdx ? (
+                  <span className="rounded-full bg-good/[0.16] px-1.5 py-0.5 text-[8px] font-extrabold tracking-[0.1em] text-good">
+                    TODAY
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setTodayIdx(i)}
+                    className="cursor-pointer rounded-full border border-white/[0.07] bg-white/[0.04] px-2 py-1 text-[9px] font-bold uppercase tracking-[0.06em] text-ink-3 hover:border-good/30 hover:text-good"
+                  >
+                    Today is →
+                  </button>
+                )}
+                <MiniBtn label="Edit plan" onClick={() => setExpanded(expanded === i ? null : i)}>
+                  <Settings2 size={12} aria-hidden />
+                </MiniBtn>
+                <MiniBtn
+                  label="Move up"
+                  onClick={() => {
+                    if (i === 0) return;
+                    const next = draft.slice();
+                    [next[i - 1], next[i]] = [next[i], next[i - 1]];
+                    setDraft(next);
+                    if (todayIdx === i) setTodayIdx(i - 1);
+                    else if (todayIdx === i - 1) setTodayIdx(i);
+                  }}
+                >
+                  ↑
+                </MiniBtn>
+                <MiniBtn
+                  label="Move down"
+                  onClick={() => {
+                    if (i >= draft.length - 1) return;
+                    const next = draft.slice();
+                    [next[i + 1], next[i]] = [next[i], next[i + 1]];
+                    setDraft(next);
+                    if (todayIdx === i) setTodayIdx(i + 1);
+                    else if (todayIdx === i + 1) setTodayIdx(i);
+                  }}
+                >
+                  ↓
+                </MiniBtn>
+                <MiniBtn
+                  label="Delete"
+                  danger
+                  onClick={() => {
+                    if (draft.length <= 1) {
+                      alert('Need at least one day in the cycle.');
+                      return;
+                    }
+                    const next = draft.filter((_, j) => j !== i);
+                    setDraft(next);
+                    if (todayIdx >= next.length) setTodayIdx(next.length - 1);
+                    else if (i < todayIdx) setTodayIdx(todayIdx - 1);
+                  }}
+                >
+                  ×
+                </MiniBtn>
+              </div>
+              {expanded === i && (
+                <div className="mb-1.5 mt-1.5 rounded-lg border border-white/[0.07] bg-black/20 p-3">
+                  {matchedDay ? (
+                    <div className="flex flex-col gap-3">
+                      <div>
+                        <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[0.1em] text-ink-3">
+                          Muscle groups
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {(Object.keys(MUSCLE_GROUP_LABELS) as MuscleGroupKey[]).map((k) => {
+                            const active = matchedDay.muscleGroups.includes(k);
+                            return (
+                              <FilterChip
+                                key={k}
+                                active={active}
+                                onClick={() =>
+                                  updateDay(matchedDay.id, {
+                                    muscleGroups: active
+                                      ? matchedDay.muscleGroups.filter((m) => m !== k)
+                                      : [...matchedDay.muscleGroups, k],
+                                  })
+                                }
+                              >
+                                {MUSCLE_GROUP_LABELS[k]}
+                              </FilterChip>
+                            );
+                          })}
+                        </div>
+                        <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-[11px] text-ink-2">
+                          <input
+                            type="checkbox"
+                            checked={!!matchedDay.openBodyweight}
+                            onChange={(e) => updateDay(matchedDay.id, { openBodyweight: e.target.checked })}
+                            className="accent-white"
+                          />
+                          Open bodyweight day (ignore muscle groups above, recommend any bodyweight move)
+                        </label>
+                      </div>
+                      <div>
+                        <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[0.1em] text-ink-3">
+                          Activities (cardio / class)
+                        </div>
+                        <ActivitiesEditor
+                          activities={matchedDay.activities}
+                          onChange={(a) => updateDay(matchedDay.id, { activities: a })}
+                        />
+                      </div>
+                      <ModalField label="Pinned exercise names (comma-separated)">
+                        <TextInput
+                          defaultValue={matchedDay.pinned.join(', ')}
+                          onBlur={(e) =>
+                            updateDay(matchedDay.id, {
+                              pinned: e.target.value
+                                .split(',')
+                                .map((s) => s.trim())
+                                .filter(Boolean),
+                            })
+                          }
+                        />
+                      </ModalField>
+                    </div>
+                  ) : (
+                    <p className="m-0 text-[12px] text-ink-3">
+                      This day has no plan details yet — add it under Settings → Days first, then its plan becomes
+                      editable here.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
       <button
         type="button"
@@ -1202,6 +1654,259 @@ function RotationModal({ state, onClose }: { state: PoState; onClose: () => void
         </PrimaryButton>
       </div>
     </Modal>
+  );
+}
+
+// ============================== EXERCISE DATABASE ==========================
+function ExerciseDbModal({
+  db,
+  dbError,
+  state,
+  onAdd,
+  onClose,
+}: {
+  db: DbExercise[];
+  dbError: string | null;
+  state: PoState;
+  onAdd: (rec: DbExercise) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = React.useState('');
+  const [muscle, setMuscle] = React.useState<MuscleGroupKey | ''>('');
+  const [equipOnly, setEquipOnly] = React.useState(false);
+  const [level, setLevel] = React.useState('');
+  const [detail, setDetail] = React.useState<DbExercise | null>(null);
+
+  const results = React.useMemo(() => {
+    if (!db.length) return [];
+    return searchExercises(db, query, {
+      primaryMuscles: muscle ? MUSCLE_GROUP_MAP[muscle] : undefined,
+      equipment: equipOnly ? new Set(state.availableEquipment) : undefined,
+      level: level || undefined,
+      limit: 40,
+    });
+  }, [db, query, muscle, equipOnly, level, state.availableEquipment]);
+
+  const dayName = state.days.find((d) => d.id === state.filterDay)?.name || 'today';
+
+  if (detail) {
+    return (
+      <Modal open onClose={() => setDetail(null)} title={detail.name} maxWidth={480}>
+        <ExerciseDetail rec={detail} />
+        <div className="mt-4 flex gap-2">
+          <GhostButton onClick={() => setDetail(null)} className="flex-1">
+            Back
+          </GhostButton>
+          <PrimaryButton onClick={() => onAdd(detail)} className="flex-1">
+            Add to {dayName}
+          </PrimaryButton>
+        </div>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal open onClose={onClose} title="Exercise database" maxWidth={520}>
+      <TextInput
+        autoFocus
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Search e.g. incline db press"
+        className="mb-3 w-full"
+      />
+      <div className="mb-3 flex flex-wrap gap-1.5">
+        <FilterChip active={muscle === ''} onClick={() => setMuscle('')}>
+          All muscles
+        </FilterChip>
+        {(Object.keys(MUSCLE_GROUP_LABELS) as MuscleGroupKey[]).map((k) => (
+          <FilterChip key={k} active={muscle === k} onClick={() => setMuscle(muscle === k ? '' : k)}>
+            {MUSCLE_GROUP_LABELS[k]}
+          </FilterChip>
+        ))}
+      </div>
+      <div className="mb-3 flex items-center gap-3">
+        <label className="flex cursor-pointer items-center gap-1.5 text-[12px] text-ink-2">
+          <input
+            type="checkbox"
+            checked={equipOnly}
+            onChange={(e) => setEquipOnly(e.target.checked)}
+            className="accent-white"
+          />
+          My equipment only
+        </label>
+        <SelectInput value={level} onChange={(e) => setLevel(e.target.value)} className="ml-auto text-[12px]">
+          <option value="">Any level</option>
+          <option value="beginner">Beginner</option>
+          <option value="intermediate">Intermediate</option>
+          <option value="expert">Expert</option>
+        </SelectInput>
+      </div>
+      {dbError && (
+        <div className="mb-3 rounded-lg border border-bad/30 bg-bad/10 px-3 py-2 text-[12px] text-bad">
+          Couldn't load the exercise database: {dbError}
+        </div>
+      )}
+      {!dbError && !db.length && <EmptyState>Loading exercise database…</EmptyState>}
+      <div className="flex max-h-[50vh] flex-col gap-1.5 overflow-y-auto">
+        {db.length > 0 && results.length === 0 && (
+          <EmptyState>No matches. Try a different search or filter.</EmptyState>
+        )}
+        {results.map((rec) => (
+          <button
+            key={rec.id}
+            type="button"
+            onClick={() => setDetail(rec)}
+            className="flex cursor-pointer items-center justify-between gap-2 rounded-[10px] border border-white/[0.07] bg-white/[0.025] px-3 py-2.5 text-left text-[13px] transition-colors hover:border-white/[0.14] hover:bg-white/[0.05]"
+          >
+            <span className="min-w-0 truncate font-semibold text-ink">{rec.name}</span>
+            <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.06em] text-ink-3">
+              {deriveExerciseType(rec)}
+            </span>
+          </button>
+        ))}
+      </div>
+      {results.length >= 40 && (
+        <div className="mt-2 text-center text-[11px] text-ink-4">
+          Showing first 40 — narrow your search for more.
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function FilterChip({
+  children,
+  active,
+  onClick,
+}: {
+  children: React.ReactNode;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`cursor-pointer rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+        active
+          ? 'border-transparent bg-gradient-to-b from-white to-[#e8e5dd] text-[#0a0a0b]'
+          : 'border-white/[0.07] bg-white/[0.04] text-ink-2 hover:text-ink'
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ExerciseDetail({ rec }: { rec: DbExercise }) {
+  const [showImg, setShowImg] = React.useState(false);
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap gap-1.5">
+        <Tag>{deriveExerciseType(rec)}</Tag>
+        {rec.equipment && <Tag>{rec.equipment}</Tag>}
+        <Tag>{rec.level}</Tag>
+        {rec.primaryMuscles.map((m) => (
+          <Tag key={m}>{m}</Tag>
+        ))}
+      </div>
+      {!showImg ? (
+        <button
+          type="button"
+          onClick={() => setShowImg(true)}
+          className="cursor-pointer rounded-lg border border-dashed border-white/[0.07] py-2 text-center text-[12px] text-ink-3 hover:text-ink"
+        >
+          Show image
+        </button>
+      ) : (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={exerciseImageUrl(rec.id)}
+          alt={rec.name}
+          className="w-full rounded-xl border border-white/[0.07]"
+          onError={(e) => {
+            (e.currentTarget as HTMLImageElement).style.display = 'none';
+          }}
+        />
+      )}
+      {rec.instructions.length > 0 && (
+        <ol className="m-0 flex list-decimal flex-col gap-1.5 pl-4 text-[12.5px] leading-normal text-ink-2">
+          {rec.instructions.map((step, i) => (
+            <li key={i}>{step}</li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+function Tag({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="rounded-full bg-white/[0.06] px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.04em] text-ink-3">
+      {children}
+    </span>
+  );
+}
+
+function ActivitiesEditor({
+  activities,
+  onChange,
+}: {
+  activities: PlanActivity[];
+  onChange: (a: PlanActivity[]) => void;
+}) {
+  const [newType, setNewType] = React.useState<'cardio' | 'class'>('cardio');
+  const [newLabel, setNewLabel] = React.useState('');
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      {activities.map((a, i) => (
+        <div
+          key={i}
+          className="flex items-center gap-2 rounded-lg border border-white/[0.07] bg-white/[0.025] px-2.5 py-1.5 text-[12px]"
+        >
+          <span className="rounded-full bg-white/[0.06] px-2 py-0.5 text-[10px] font-bold uppercase text-ink-3">
+            {a.type}
+          </span>
+          <span className="flex-1 text-ink">{a.label}</span>
+          <button
+            type="button"
+            onClick={() => onChange(activities.filter((_, j) => j !== i))}
+            aria-label="Remove activity"
+            className="cursor-pointer text-ink-4 hover:text-bad"
+          >
+            <X size={12} aria-hidden />
+          </button>
+        </div>
+      ))}
+      <div className="flex gap-1.5">
+        <SelectInput
+          value={newType}
+          onChange={(e) => setNewType(e.target.value as 'cardio' | 'class')}
+          className="text-[12px]"
+        >
+          <option value="cardio">Cardio</option>
+          <option value="class">Class</option>
+        </SelectInput>
+        <input
+          value={newLabel}
+          onChange={(e) => setNewLabel(e.target.value)}
+          placeholder="e.g. Sprints"
+          className="min-w-0 flex-1 rounded-lg border border-white/[0.07] bg-black/30 px-2.5 py-1.5 text-[12px] text-ink outline-none"
+        />
+        <button
+          type="button"
+          onClick={() => {
+            if (!newLabel.trim()) return;
+            onChange([...activities, { type: newType, label: newLabel.trim() }]);
+            setNewLabel('');
+          }}
+          className="cursor-pointer rounded-lg border border-white/[0.07] bg-white/[0.04] px-3 text-[12px] font-bold text-ink-2 hover:text-ink"
+        >
+          +
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1242,11 +1947,15 @@ function ExerciseModal({
   const [name, setName] = React.useState(exercise?.name || '');
   const [gym, setGym] = React.useState(exercise?.gym || state.filterGym);
   const [day, setDay] = React.useState(exercise?.day || state.filterDay);
-  const [bw, setBw] = React.useState(!!exercise?.bw);
+  const [type, setType] = React.useState<ExerciseType>(exercise?.type || 'weighted');
   const [startWeight, setStartWeight] = React.useState(String(exercise?.startWeight ?? 20));
   const [repMin, setRepMin] = React.useState(String(exercise?.repMin ?? 6));
   const [repMax, setRepMax] = React.useState(String(exercise?.repMax ?? 8));
   const [step, setStep] = React.useState(String(exercise?.step ?? 2.5));
+
+  const isWeighted = type === 'weighted';
+  const isBodyweight = type === 'bodyweight';
+  const needsSetsReps = isWeighted || isBodyweight;
 
   const save = () => {
     if (!name.trim()) {
@@ -1258,11 +1967,11 @@ function ExerciseModal({
       name: name.trim(),
       gym,
       day,
-      bw,
-      startWeight: bw ? 0 : parseFloat(startWeight) || 0,
-      repMin: parseInt(repMin, 10) || 6,
-      repMax: parseInt(repMax, 10) || 8,
-      step: bw ? 1 : parseFloat(step) || 2.5,
+      type,
+      startWeight: needsSetsReps ? (isWeighted ? parseFloat(startWeight) || 0 : 0) : undefined,
+      repMin: needsSetsReps ? parseInt(repMin, 10) || 6 : undefined,
+      repMax: needsSetsReps ? parseInt(repMax, 10) || 8 : undefined,
+      step: needsSetsReps ? (isBodyweight ? 1 : parseFloat(step) || 2.5) : undefined,
     };
     if (mode === 'edit' && exercise) {
       storeSet(PO_KEY, {
@@ -1312,24 +2021,40 @@ function ExerciseModal({
         <ModalField label="Day">
           <Seg options={state.days.map((d) => ({ value: d.id, label: d.name }))} value={day} onChange={setDay} />
         </ModalField>
-        <label className="flex cursor-pointer items-center gap-2 py-1 text-[13px] text-ink-2">
-          <input type="checkbox" checked={bw} onChange={(e) => setBw(e.target.checked)} className="accent-white" />
-          Bodyweight (track reps only, no weight)
-        </label>
-        {!bw && (
+        <ModalField label="Type">
+          <Seg
+            options={[
+              { value: 'weighted', label: 'Weighted' },
+              { value: 'bodyweight', label: 'Bodyweight' },
+              { value: 'cardio', label: 'Cardio' },
+              { value: 'class', label: 'Class' },
+            ]}
+            value={type}
+            onChange={setType}
+          />
+        </ModalField>
+        {type === 'cardio' && (
+          <p className="m-0 text-[12px] text-ink-3">Logs distance, duration, and pace. No sets/reps.</p>
+        )}
+        {type === 'class' && (
+          <p className="m-0 text-[12px] text-ink-3">Logs attendance only — no metrics.</p>
+        )}
+        {isWeighted && (
           <ModalField label="Starting weight">
             <TextInput type="number" step="0.5" value={startWeight} onChange={(e) => setStartWeight(e.target.value)} />
           </ModalField>
         )}
-        <div className="grid grid-cols-2 gap-2.5">
-          <ModalField label="Reps min">
-            <TextInput type="number" value={repMin} onChange={(e) => setRepMin(e.target.value)} />
-          </ModalField>
-          <ModalField label="Reps max">
-            <TextInput type="number" value={repMax} onChange={(e) => setRepMax(e.target.value)} />
-          </ModalField>
-        </div>
-        {!bw && (
+        {needsSetsReps && (
+          <div className="grid grid-cols-2 gap-2.5">
+            <ModalField label="Reps min">
+              <TextInput type="number" value={repMin} onChange={(e) => setRepMin(e.target.value)} />
+            </ModalField>
+            <ModalField label="Reps max">
+              <TextInput type="number" value={repMax} onChange={(e) => setRepMax(e.target.value)} />
+            </ModalField>
+          </div>
+        )}
+        {isWeighted && (
           <ModalField label="Increment">
             <TextInput type="number" step="0.5" value={step} onChange={(e) => setStep(e.target.value)} />
           </ModalField>
@@ -1451,6 +2176,34 @@ function SettingsModal({ state, onClose }: { state: PoState; onClose: () => void
           </button>
         </div>
       ))}
+
+      <div className="mb-5">
+        <Eyebrow className="mb-2">Equipment</Eyebrow>
+        <p className="mb-2 text-[12px] leading-normal text-ink-3">
+          Recommendations only suggest exercises you can actually do. Bodyweight exercises always pass regardless of
+          what's checked here.
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          {EQUIPMENT_VOCAB.map((eq) => {
+            const active = s.availableEquipment.includes(eq);
+            return (
+              <FilterChip
+                key={eq}
+                active={active}
+                onClick={() => {
+                  const cur = loadPoState();
+                  const next = active
+                    ? cur.availableEquipment.filter((x) => x !== eq)
+                    : [...cur.availableEquipment, eq];
+                  storeSet(PO_KEY, { ...cur, availableEquipment: next });
+                }}
+              >
+                {EQUIPMENT_LABELS[eq]}
+              </FilterChip>
+            );
+          })}
+        </div>
+      </div>
 
       <div className="mb-5">
         <Eyebrow className="mb-2">Data</Eyebrow>
