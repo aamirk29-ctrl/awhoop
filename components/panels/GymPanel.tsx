@@ -6,7 +6,8 @@
 // settings). Same localStorage keys, so logs and sync carry over.
 
 import * as React from 'react';
-import { Pencil, Plus, Search, Settings2, X } from 'lucide-react';
+import { ChevronDown, History as HistoryIcon, Pencil, Plus, Search, Settings2, X } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
 import type { BentoAccent } from '@/components/ui/aurora-bento-grid';
 import { storeGet, storeSet, storeRemove, useStorageTick } from '@/lib/storage';
 import { dateToKey, parseDateKey } from '@/lib/dates';
@@ -29,6 +30,23 @@ import {
   type RecommendationGroup,
   type SetLog,
 } from '@/lib/gym';
+import {
+  RANGE_OPTIONS,
+  allTimeDelta,
+  attendanceStreak,
+  bestValue,
+  computeSessionPoints,
+  defaultMetric,
+  filterByRange,
+  groupIntoSessions,
+  last30DaysDelta,
+  metricsForType,
+  progressDeltas,
+  type ExerciseSession,
+  type HistoryMetric,
+  type RangeKey,
+  type SessionPoint,
+} from '@/lib/gym-history';
 import {
   EQUIPMENT_LABELS,
   EQUIPMENT_VOCAB,
@@ -173,6 +191,7 @@ export default function GymPanel({ accent }: { accent: BentoAccent }) {
         doneDays={doneDays}
         mutate={mutate}
         db={db}
+        wtEntries={wtEntries}
         onAddExercise={() => setExModal({ mode: 'add' })}
         onEditExercise={(ex) => setExModal({ mode: 'edit', ex })}
         onOpenDb={() => setDbModalOpen(true)}
@@ -450,6 +469,340 @@ function WeightChart({ entries, accent }: { entries: WtEntry[]; accent: string }
   );
 }
 
+// ============================== EXERCISE HISTORY ============================
+
+function formatPace(v: number): string {
+  const m = Math.floor(v);
+  const s = Math.round((v - m) * 60);
+  return `${m}:${String(s).padStart(2, '0')}/km`;
+}
+
+function formatMetric(metric: HistoryMetric, v: number, unit: string): string {
+  switch (metric) {
+    case 'e1rm':
+      return `${Math.round(v)}${unit}`;
+    case 'weight':
+      return `${v}${unit}`;
+    case 'volume':
+      return `${Math.round(v).toLocaleString()}${unit}`;
+    case 'reps':
+      return `${Math.round(v)} reps`;
+    case 'pace':
+      return formatPace(v);
+    case 'distance':
+      return `${v.toFixed(1)}km`;
+    default:
+      return String(v);
+  }
+}
+
+/** Whether a delta on this metric represents improvement — pace is the one
+ *  metric where lower is better. */
+function deltaGood(metric: HistoryMetric, delta: number): boolean {
+  return metric === 'pace' ? delta < 0 : delta > 0;
+}
+
+function formatDelta(metric: HistoryMetric, v: number, unit: string): string {
+  const sign = v > 0 ? '+' : v < 0 ? '−' : '±';
+  return `${sign}${formatMetric(metric, Math.abs(v), unit)}`;
+}
+
+function formatSessionDate(dateKey: string): string {
+  const dt = parseDateKey(dateKey);
+  return `${DOWS[dt.getDay()]} ${MONS[dt.getMonth()]} ${dt.getDate()}`;
+}
+
+/** Line chart for a metric's session points — same hand-rolled SVG
+ *  conventions as WeightChart (gradient fill, smoothed line, emphasized
+ *  last point) so it reads as the same chart language. Points computed from
+ *  a high-rep set (e1RM unreliable past HIGH_REP_THRESHOLD) render hollow
+ *  and dashed rather than solid, per-point — flagged, not hidden. */
+function HistoryChart({
+  points,
+  accent,
+  metric,
+  unit,
+}: {
+  points: SessionPoint[];
+  accent: string;
+  metric: HistoryMetric;
+  unit: string;
+}) {
+  const gradId = React.useId().replace(/[:]/g, '');
+  const withVal = points.filter((p): p is SessionPoint & { value: number } => p.value != null);
+  const vals = withVal.map((p) => p.value);
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const pad = Math.max((max - min) * 0.15, metric === 'pace' ? 0.15 : 0.5);
+  const yMin = min - pad;
+  const yMax = max + pad;
+  const xLeft = 8,
+    xRight = 312,
+    yTop = 20,
+    yBot = 110;
+  const xFor = (i: number) => (withVal.length === 1 ? xRight : xLeft + (i / (withVal.length - 1)) * (xRight - xLeft));
+  const yFor = (v: number) => yBot - ((v - yMin) / (yMax - yMin || 1)) * (yBot - yTop);
+  const pts = withVal.map((p, i) => ({ x: xFor(i), y: yFor(p.value) }));
+  const linePath = wtSmoothPath(pts);
+  const areaPath = `${linePath} L ${pts[pts.length - 1].x.toFixed(2)} ${yBot} L ${pts[0].x.toFixed(2)} ${yBot} Z`;
+  const anyUnreliable = withVal.some((p) => p.unreliable);
+
+  return (
+    <div>
+      <div className="relative">
+        <div className="absolute bottom-0 left-0 top-0 flex w-12 flex-col justify-between py-1">
+          <span className="font-mono text-[10px] text-ink-4">{formatMetric(metric, yMax, unit)}</span>
+          <span className="font-mono text-[10px] text-ink-4">{formatMetric(metric, yMin, unit)}</span>
+        </div>
+        <svg
+          viewBox="0 0 320 130"
+          preserveAspectRatio="none"
+          className="ml-12 block h-[130px] w-[calc(100%-3rem)]"
+          aria-hidden
+        >
+          <defs>
+            <linearGradient id={`histFill-${gradId}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={accent} stopOpacity="0.25" />
+              <stop offset="100%" stopColor={accent} stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          {[20, 65, 110].map((y) => (
+            <line key={y} x1="0" y1={y} x2="320" y2={y} stroke="rgba(255,255,255,0.05)" strokeWidth="1" />
+          ))}
+          <path d={areaPath} fill={`url(#histFill-${gradId})`} />
+          <path d={linePath} fill="none" stroke={accent} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+          {pts.map((p, i) => {
+            const isLast = i === pts.length - 1;
+            const unreliable = withVal[i].unreliable;
+            return (
+              <circle
+                key={i}
+                cx={p.x}
+                cy={p.y}
+                r={isLast ? 5 : 3}
+                fill={isLast ? '#fff' : unreliable ? 'transparent' : accent}
+                stroke={isLast ? accent : unreliable ? accent : '#111113'}
+                strokeWidth={isLast ? 2 : 1.5}
+                strokeDasharray={!isLast && unreliable ? '2 1.5' : undefined}
+              />
+            );
+          })}
+        </svg>
+      </div>
+      {anyUnreliable && (
+        <div className="mt-1.5 text-center text-[10px] text-ink-4">
+          ○ hollow points: high-rep estimate, less reliable
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExerciseHistoryPanel({
+  ex,
+  logs,
+  wtEntries,
+  unit,
+  accent,
+  onLogClick,
+}: {
+  ex: Exercise;
+  logs: SetLog[];
+  wtEntries: WtEntry[];
+  unit: string;
+  accent: BentoAccent;
+  onLogClick: () => void;
+}) {
+  const sessions = React.useMemo(() => groupIntoSessions(logs), [logs]);
+  const [range, setRange] = React.useState<RangeKey>('M');
+  const [metric, setMetric] = React.useState<HistoryMetric>(() => defaultMetric(ex.type));
+  const metrics = metricsForType(ex.type);
+
+  if (ex.type === 'class') {
+    return <ClassHistoryView sessions={sessions} onLogClick={onLogClick} />;
+  }
+
+  if (!sessions.length) {
+    return (
+      <div className="rounded-xl border border-dashed border-white/[0.07] bg-white/[0.02] p-5 text-center">
+        <p className="m-0 text-[12.5px] text-ink-3">No sessions logged yet for {ex.name}.</p>
+        <button
+          type="button"
+          onClick={onLogClick}
+          className="mt-3 cursor-pointer rounded-lg border border-white/[0.09] bg-white/[0.04] px-3 py-1.5 text-[12px] font-semibold text-ink-2 hover:text-ink"
+        >
+          + Log a session
+        </button>
+      </div>
+    );
+  }
+
+  const allPoints = computeSessionPoints(ex.type, sessions, metric, wtEntries);
+  const allDeltas = progressDeltas(allPoints);
+  const rows = sessions.map((session, i) => ({ session, point: allPoints[i], delta: allDeltas[i] })).reverse();
+
+  const rangedSessions = filterByRange(sessions, range);
+  const rangedDateKeys = new Set(rangedSessions.map((s) => s.dateKey));
+  const rangedPoints = allPoints.filter((p) => rangedDateKeys.has(p.dateKey));
+  const rangedRows = rows.filter((r) => rangedDateKeys.has(r.session.dateKey));
+
+  const atDelta = allTimeDelta(allPoints);
+  const d30 = last30DaysDelta(allPoints);
+  const best = bestValue(allPoints, metric);
+  const lastSession = sessions[sessions.length - 1];
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        {metrics.length > 1 && (
+          <Seg
+            className="max-w-[240px]"
+            options={metrics.map((m) => ({ value: m.id, label: m.label }))}
+            value={metric}
+            onChange={(v) => setMetric(v)}
+          />
+        )}
+        <Seg
+          className="max-w-[280px]"
+          options={RANGE_OPTIONS.map((r) => ({ value: r.id, label: r.label }))}
+          value={range}
+          onChange={(v) => setRange(v)}
+        />
+      </div>
+
+      {atDelta != null && (
+        <div
+          className={`text-[13px] font-medium tabular-nums ${
+            atDelta === 0 ? 'text-ink-3' : deltaGood(metric, atDelta) ? 'text-good' : 'text-warn'
+          }`}
+        >
+          {formatDelta(metric, atDelta, unit)} · all time
+        </div>
+      )}
+
+      {rangedPoints.filter((p) => p.value != null).length >= 2 ? (
+        <HistoryChart points={rangedPoints} accent={accent.from} metric={metric} unit={unit} />
+      ) : (
+        <div className="py-6 text-center text-[11px] text-ink-3">Need 2+ sessions in this range for a chart.</div>
+      )}
+
+      <div className="grid grid-cols-3 gap-2">
+        <StatBox label="Sessions" value={String(sessions.length)} />
+        <StatBox label="30d change" value={d30 != null ? formatDelta(metric, d30, unit) : '—'} />
+        <StatBox label="Best" value={best != null ? formatMetric(metric, best, unit) : '—'} />
+      </div>
+
+      {lastSession && (
+        <div>
+          <SubTitle>Most recent · {formatSessionDate(lastSession.dateKey)}</SubTitle>
+          <div className="flex flex-wrap gap-1.5">
+            {lastSession.sets.map((s, i) => (
+              <span
+                key={i}
+                className="rounded-full border border-white/[0.07] bg-white/[0.04] px-2.5 py-1 font-mono text-[12px] tabular-nums text-ink"
+              >
+                {ex.type === 'cardio'
+                  ? `${s.distanceKm ? `${s.distanceKm.toFixed(1)}km` : ''}${s.durationMin ? ` ${s.durationMin}min` : ''}`
+                  : `${s.reps ?? 0}${s.weight ? ` @${s.weight}${unit}` : ''}`}
+              </span>
+            ))}
+          </div>
+          {ex.type !== 'cardio' && (
+            <div className="mt-1.5 text-[11px] text-ink-3">
+              {lastSession.sets.reduce((s, l) => s + (l.reps || 0), 0)} total reps
+            </div>
+          )}
+        </div>
+      )}
+
+      <div>
+        <SubTitle>All sessions{range !== 'ALL' ? ` (${RANGE_OPTIONS.find((r) => r.id === range)?.label})` : ''}</SubTitle>
+        {!rangedRows.length ? (
+          <div className="py-3 text-center text-[12px] italic text-ink-3">No sessions in this range.</div>
+        ) : (
+          <div className="flex flex-col">
+            {rangedRows.map(({ session, point, delta }) => (
+              <div
+                key={session.dateKey}
+                className="grid grid-cols-[64px_1fr_auto] items-center gap-2 border-b border-white/[0.06] py-2 text-[12.5px] last:border-b-0"
+              >
+                <span className="font-mono text-[11px] text-ink-3">{formatSessionDate(session.dateKey)}</span>
+                <span className="min-w-0 truncate text-ink">
+                  {ex.type === 'cardio'
+                    ? `${session.sets.reduce((s, l) => s + (l.distanceKm || 0), 0).toFixed(1)}km · ${Math.round(session.sets.reduce((s, l) => s + (l.durationMin || 0), 0))}min`
+                    : `${session.sets.length} × ${session.sets.map((l) => l.reps ?? 0).join('/')}${
+                        ex.type === 'weighted' ? ` @ ${session.sets[session.sets.length - 1]?.weight ?? 0}${unit}` : ''
+                      }`}
+                </span>
+                <span
+                  className={`whitespace-nowrap font-mono text-[11px] tabular-nums ${
+                    delta == null ? 'text-ink-4' : delta === 0 ? 'text-ink-4' : deltaGood(metric, delta) ? 'text-good' : 'text-warn'
+                  }`}
+                >
+                  {delta == null ? '—' : formatDelta(metric, delta, unit)}
+                  {point.unreliable ? ' ○' : ''}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <GhostButton onClick={onLogClick} className="w-full">
+        + Log a session
+      </GhostButton>
+    </div>
+  );
+}
+
+function ClassHistoryView({ sessions, onLogClick }: { sessions: ExerciseSession[]; onLogClick: () => void }) {
+  const streak = attendanceStreak(sessions);
+
+  if (!sessions.length) {
+    return (
+      <div className="rounded-xl border border-dashed border-white/[0.07] bg-white/[0.02] p-5 text-center">
+        <p className="m-0 text-[12.5px] text-ink-3">No attendance logged yet.</p>
+        <button
+          type="button"
+          onClick={onLogClick}
+          className="mt-3 cursor-pointer rounded-lg border border-white/[0.09] bg-white/[0.04] px-3 py-1.5 text-[12px] font-semibold text-ink-2 hover:text-ink"
+        >
+          + Mark attended
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="grid grid-cols-2 gap-2">
+        <StatBox label="Sessions attended" value={String(sessions.length)} />
+        <StatBox label="Current streak" value={streak >= 2 ? String(streak) : '—'} unit={streak >= 2 ? 'in a row' : undefined} />
+      </div>
+      <div>
+        <SubTitle>History</SubTitle>
+        <div className="flex flex-col">
+          {sessions
+            .slice()
+            .reverse()
+            .map((s) => (
+              <div
+                key={s.dateKey}
+                className="flex items-center justify-between border-b border-white/[0.06] py-2 text-[12.5px] last:border-b-0"
+              >
+                <span className="font-mono text-[11px] text-ink-3">{formatSessionDate(s.dateKey)}</span>
+                <span className="text-ink-2">Attended</span>
+              </div>
+            ))}
+        </div>
+      </div>
+      <GhostButton onClick={onLogClick} className="w-full">
+        + Mark attended
+      </GhostButton>
+    </div>
+  );
+}
+
 // Composition estimate — weight delta + strength trend + training frequency.
 function computeComposition(state: PoState, entries: WtEntry[]) {
   if (!GYM_CONFIG.composition.enabled || entries.length < 2) return null;
@@ -599,6 +952,7 @@ function CoachCard({
   doneDays,
   mutate,
   db,
+  wtEntries,
   onAddExercise,
   onEditExercise,
   onOpenDb,
@@ -608,6 +962,7 @@ function CoachCard({
   doneDays: Record<string, string>;
   mutate: (patch: Partial<PoState>) => void;
   db: DbExercise[];
+  wtEntries: WtEntry[];
   onAddExercise: () => void;
   onEditExercise: (ex: Exercise) => void;
   onOpenDb: () => void;
@@ -628,6 +983,7 @@ function CoachCard({
   const [distanceInput, setDistanceInput] = React.useState('');
   const [durationInput, setDurationInput] = React.useState('');
   const [pastOpen, setPastOpen] = React.useState(false);
+  const [openHistoryId, setOpenHistoryId] = React.useState<string | null>(null);
 
   // pre-fill weight when exercise changes
   React.useEffect(() => {
@@ -1214,17 +1570,57 @@ function CoachCard({
           </div>
         ) : (
           <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
-            {todaySum.perEx.map((e) => (
-              <li
-                key={e.ex.id}
-                className="flex items-center justify-between gap-2 rounded-[10px] border border-white/[0.07] bg-white/[0.025] px-3 py-2.5 text-[13px]"
-              >
-                <span className="min-w-0 break-words font-semibold text-ink">{e.ex.name}</span>
-                <span className="font-mono text-[11px] tabular-nums text-ink-3">
-                  {summarizeExerciseSets(e.ex, e.sets, unit)}
-                </span>
-              </li>
-            ))}
+            {todaySum.perEx.map((e) => {
+              const isOpen = openHistoryId === e.ex.id;
+              return (
+                <li
+                  key={e.ex.id}
+                  className="rounded-[10px] border border-white/[0.07] bg-white/[0.025] px-3 py-2.5 text-[13px]"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="min-w-0 break-words font-semibold text-ink">{e.ex.name}</span>
+                    <span className="font-mono text-[11px] tabular-nums text-ink-3">
+                      {summarizeExerciseSets(e.ex, e.sets, unit)}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setOpenHistoryId(isOpen ? null : e.ex.id)}
+                    aria-expanded={isOpen}
+                    className="mt-1.5 flex cursor-pointer items-center gap-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-ink-3 transition-colors hover:text-ink"
+                  >
+                    <HistoryIcon size={11} aria-hidden />
+                    History
+                    <ChevronDown size={11} aria-hidden className={`transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+                  </button>
+                  <AnimatePresence initial={false}>
+                    {isOpen && (
+                      <motion.div
+                        initial={{ opacity: 0, height: 0 }}
+                        animate={{ opacity: 1, height: 'auto' }}
+                        exit={{ opacity: 0, height: 0 }}
+                        transition={{ duration: 0.25, ease: 'easeOut' }}
+                        className="overflow-hidden"
+                      >
+                        <div className="mt-3 border-t border-white/[0.06] pt-3">
+                          <ExerciseHistoryPanel
+                            ex={e.ex}
+                            logs={state.logs[e.ex.id] || []}
+                            wtEntries={wtEntries}
+                            unit={unit}
+                            accent={accent}
+                            onLogClick={() => {
+                              mutate({ currentEx: e.ex.id, filterGym: e.ex.gym === 'both' ? state.filterGym : e.ex.gym });
+                              setOpenHistoryId(null);
+                            }}
+                          />
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>
