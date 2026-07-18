@@ -147,6 +147,15 @@ function isUserEditing(): boolean {
   return ae.getAttribute?.('contenteditable') === 'true';
 }
 
+// Applying a remote snapshot must never destroy local data. Earlier this
+// function also deleted any local key not present in `remote` — but `remote`
+// is only ever as fresh as the last successful push, so a slow/failed push
+// (or a refresh landing mid-debounce) meant the *next* load would wipe out
+// whatever had been added since. Confirmed in production: a stale
+// `projects` row silently deleted a session's worth of newly-added projects
+// and contacts on reload. Deletion is gone for good — a key only ever
+// disappears locally because the user explicitly removed it, which already
+// propagates via the normal localStorage.removeItem → schedulePush path.
 function applyRemote(ch: Channel, remote: Record<string, unknown>): boolean {
   if (!remote || typeof remote !== 'object') return false;
   suppressSync = true;
@@ -166,14 +175,37 @@ function applyRemote(ch: Channel, remote: Record<string, unknown>): boolean {
         }
       }
     }
-    for (const k of listChannelKeys(ch)) {
-      if (!(k in remote)) {
-        try {
-          origRemove!(k);
-          changed = true;
-        } catch {
-          /* noop */
-        }
+  } finally {
+    suppressSync = false;
+  }
+  if (changed) emitStorageChange();
+  return changed;
+}
+
+// The very first pull on page load is the dangerous one: it races against
+// any write made just before the reload that hasn't finished its 250ms
+// debounced push yet. So on initial load, local always wins outright — a
+// key already present locally is left untouched even if the remote value
+// differs, and only keys this browser has genuinely never seen (a fresh
+// device, or a key added on another device) get filled in from remote.
+// Local is then pushed right after, so if local was ahead, Supabase catches
+// up instead of the reverse. Realtime updates (another device editing while
+// this tab is open) still use the overwrite-only applyRemote above, which
+// is the actual live-sync feature and isn't part of this race.
+function applyRemoteAdditive(ch: Channel, remote: Record<string, unknown>): boolean {
+  if (!remote || typeof remote !== 'object') return false;
+  suppressSync = true;
+  let changed = false;
+  try {
+    for (const k of Object.keys(remote)) {
+      if (!matches(ch, k)) continue;
+      if (localStorage.getItem(k) != null) continue;
+      const value = ch.applyMerge ? ch.applyMerge(k, remote[k], null) : remote[k];
+      try {
+        origSet!(k, JSON.stringify(value));
+        changed = true;
+      } catch {
+        /* quota */
       }
     }
   } finally {
@@ -276,7 +308,11 @@ export function initCloudSync() {
           .maybeSingle();
         if (!error && data?.data && Object.keys(data.data).length > 0) {
           ch.lastSyncedJson = JSON.stringify(data.data);
-          maybeApplyRemote(ch, data.data);
+          applyRemoteAdditive(ch, data.data);
+          // Local may hold newer or extra data than this snapshot (the race
+          // this whole function exists to avoid) — push to reconcile. A
+          // no-op if local already matches what was just fetched.
+          schedulePush(ch);
         } else if (Object.keys(collect(ch)).length > 0) {
           schedulePush(ch);
         }
