@@ -60,6 +60,7 @@ const CHANNELS: Channel[] = [
     syncedKeys: [
       'cfa_progress_v1',
       'cfa_study_slots_v1',
+      'cfa_topic_notes_v1',
       'projects_active_tab',
       'projects_list_v1',
       'network_contacts_v1',

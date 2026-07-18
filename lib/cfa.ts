@@ -117,6 +117,30 @@ export function readingsForTopic(topicId: string): CfaReading[] {
 
 const PROGRESS_KEY = 'cfa_progress_v1';
 const SLOTS_KEY = 'cfa_study_slots_v1';
+const TOPIC_NOTES_KEY = 'cfa_topic_notes_v1';
+
+// ---- per-topic weakness notes -----------------------------------------------
+
+/** confidence: 1 (weak) – 5 (strong) self-rating, plus free-text detail the
+ *  slider alone can't capture ("duration/convexity still shaky, redo M11"). */
+export type CfaTopicNote = { confidence: number; notes: string };
+export type CfaTopicNotes = Record<string, CfaTopicNote>;
+
+const DEFAULT_TOPIC_NOTE: CfaTopicNote = { confidence: 3, notes: '' };
+
+export function loadTopicNotes(): CfaTopicNotes {
+  return storeGet<CfaTopicNotes>(TOPIC_NOTES_KEY) || {};
+}
+
+export function getTopicNote(topicId: string): CfaTopicNote {
+  return loadTopicNotes()[topicId] || DEFAULT_TOPIC_NOTE;
+}
+
+export function saveTopicNote(topicId: string, patch: Partial<CfaTopicNote>) {
+  const map = loadTopicNotes();
+  const cur = map[topicId] || DEFAULT_TOPIC_NOTE;
+  storeSet(TOPIC_NOTES_KEY, { ...map, [topicId]: { ...cur, ...patch } });
+}
 
 export function loadCfaProgress(): CfaProgress {
   return storeGet<CfaProgress>(PROGRESS_KEY) || {};

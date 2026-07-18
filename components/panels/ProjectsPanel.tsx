@@ -36,12 +36,14 @@ import {
   type StudySlotConfig,
   daysUntilExam,
   doneCount,
+  getTopicNote,
   loadCfaProgress,
   loadStudySlots,
   markTopicReviewed,
   mostStaleTopics,
   pctComplete,
   readingsForTopic,
+  saveTopicNote,
   saveStudySlots,
   sessionsRemaining,
   toggleReadingDone,
@@ -287,6 +289,7 @@ function CfaTab({ accent }: { accent: BentoAccent }) {
                         </label>
                       );
                     })}
+                    <TopicNotes topic={topic} />
                   </div>
                 )}
               </Card>
@@ -305,6 +308,61 @@ function CfaTab({ accent }: { accent: BentoAccent }) {
         }}
       />
       <ReviewModal topic={reviewTopic} onClose={() => setReviewTopic(null)} />
+    </div>
+  );
+}
+
+const CONFIDENCE_LABELS = ['Weak', 'Shaky', 'OK', 'Solid', 'Strong'];
+
+/** Per-topic weakness tracking: a 1-5 confidence self-rating plus free-text
+ *  detail — the rating alone can't say *what* to review, the notes alone
+ *  don't give an at-a-glance signal. Own local state so re-renders from
+ *  other storage writes (e.g. a reading checkbox elsewhere) don't reset the
+ *  textarea's cursor position. */
+function TopicNotes({ topic }: { topic: CfaTopic }) {
+  const [note, setNote] = React.useState(() => getTopicNote(topic.id));
+
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-t border-white/[0.06] px-1.5 pt-2.5">
+      <div className="flex items-center gap-3">
+        <span className="shrink-0 font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-ink-3">
+          Confidence
+        </span>
+        <span className="w-9 shrink-0 text-right text-[11px] text-ink-3">Weak</span>
+        <input
+          type="range"
+          min={1}
+          max={5}
+          step={1}
+          value={note.confidence}
+          onChange={(e) => {
+            const confidence = Number(e.target.value);
+            setNote((n) => ({ ...n, confidence }));
+            saveTopicNote(topic.id, { confidence });
+          }}
+          style={{ accentColor: topic.color }}
+          className="h-1.5 flex-1 cursor-pointer"
+          aria-label={`${topic.name} confidence`}
+        />
+        <span className="w-10 shrink-0 text-[11px] text-ink-3">Strong</span>
+        <span
+          className="w-11 shrink-0 rounded-full px-1.5 py-0.5 text-center font-mono text-[10px] font-bold"
+          style={{ background: `${topic.color}26`, color: topic.color }}
+        >
+          {CONFIDENCE_LABELS[note.confidence - 1]}
+        </span>
+      </div>
+      <textarea
+        value={note.notes}
+        onChange={(e) => {
+          const notes = e.target.value;
+          setNote((n) => ({ ...n, notes }));
+          saveTopicNote(topic.id, { notes });
+        }}
+        rows={2}
+        placeholder="Weaknesses, what to review…"
+        className="w-full rounded-lg border border-white/[0.09] bg-black/25 px-3 py-2 text-[12px] text-ink outline-none transition-colors placeholder:text-ink-4 focus:border-white/25 focus:bg-black/35"
+      />
     </div>
   );
 }
