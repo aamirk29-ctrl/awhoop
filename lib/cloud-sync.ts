@@ -56,6 +56,18 @@ const CHANNELS: Channel[] = [
     syncedPrefixes: ['nw:'],
   },
   {
+    appKey: 'projects',
+    syncedKeys: [
+      'cfa_progress_v1',
+      'cfa_study_slots_v1',
+      'projects_active_tab',
+      'projects_list_v1',
+      'network_contacts_v1',
+      'network_stale_weeks_v1',
+    ],
+    syncedPrefixes: [],
+  },
+  {
     appKey: 'po-coach',
     syncedKeys: ['po_coach_v1', 'po_coach_workout_done', 'po_coach_weights', 'po_coach_photos'],
     syncedPrefixes: [],

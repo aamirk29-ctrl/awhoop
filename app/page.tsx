@@ -4,7 +4,7 @@ import * as React from 'react';
 import dynamic from 'next/dynamic';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { MotionConfig, motion } from 'motion/react';
-import { Target, Pill, Droplets, Dumbbell, Wallet, Apple, Plus, type LucideIcon } from 'lucide-react';
+import { Target, Pill, Droplets, Dumbbell, Wallet, Apple, GraduationCap, Plus, type LucideIcon } from 'lucide-react';
 import {
   AuroraBackground,
   BentoGrid,
@@ -23,6 +23,7 @@ import { ensureRates, fmtMoney } from '@/lib/fx';
 import { loadNutritionState, resolveTargets } from '@/lib/nutrition';
 import { loadCachedEnergy, recentClosedBurns, refreshWhoopEnergy } from '@/lib/whoop';
 import { entriesFor, loadFoodLog, progress, totalsFor } from '@/lib/food';
+import { CFA_READINGS, daysUntilExam, doneCount, loadCfaProgress, pctComplete } from '@/lib/cfa';
 
 const GoalsPanel = dynamic(() => import('@/components/panels/GoalsPanel'), { ssr: false });
 const StackPanel = dynamic(() => import('@/components/panels/StackPanel'), { ssr: false });
@@ -30,8 +31,16 @@ const WaterPanel = dynamic(() => import('@/components/panels/WaterPanel'), { ssr
 const GymPanel = dynamic(() => import('@/components/panels/GymPanel'), { ssr: false });
 const FinancePanel = dynamic(() => import('@/components/panels/FinancePanel'), { ssr: false });
 const NutritionPanel = dynamic(() => import('@/components/panels/NutritionPanel'), { ssr: false });
+const ProjectsPanel = dynamic(() => import('@/components/panels/ProjectsPanel'), { ssr: false });
 
-type PanelId = 'goals' | 'stack' | 'water' | 'gym' | 'finance' | 'nutrition';
+type PanelId = 'goals' | 'stack' | 'water' | 'gym' | 'finance' | 'nutrition' | 'projects';
+
+// Finance is fully built and kept intact (component, data layer, stored data)
+// but not currently used — hidden via this flag rather than deleted, commented
+// out, or CSS-hidden (which would still mount it and run its fetches).
+// Restoring it later: remove 'finance' from this set and swap the grid tile
+// back (see the bento grid section below).
+const HIDDEN_PANELS = new Set<PanelId>(['finance']);
 
 const PANELS: Record<
   PanelId,
@@ -72,6 +81,14 @@ const PANELS: Record<
     icon: Apple,
     accent: { from: '#FDBA74', to: '#FB7185', text: '#FDBA74' },
     maxWidth: 720,
+  },
+  projects: {
+    title: 'Projects',
+    icon: GraduationCap,
+    // Own indigo/blue accent — deliberately not Finance's rose/red, so
+    // restoring Finance later doesn't collide with this box's colour.
+    accent: { from: '#6366F1', to: '#3B82F6', text: '#A5B4FC' },
+    maxWidth: 820,
   },
 };
 
@@ -116,7 +133,8 @@ function Dashboard() {
   }, []);
 
   const raw = searchParams.get('p');
-  const openId: PanelId | null = PANEL_IDS.includes(raw as PanelId) ? (raw as PanelId) : null;
+  const openId: PanelId | null =
+    PANEL_IDS.includes(raw as PanelId) && !HIDDEN_PANELS.has(raw as PanelId) ? (raw as PanelId) : null;
 
   const open = React.useCallback(
     (id: PanelId) => router.push(`/?p=${id}`, { scroll: false }),
@@ -175,6 +193,8 @@ function Dashboard() {
     const calProg = progress(eaten.kcal, nutrition.calorie.calorieTarget);
     const proProg = progress(eaten.protein, nutrition.proteinTarget);
 
+    const cfaProgress = loadCfaProgress();
+
     return {
       goals: { done: goalsDone, total: goals.length, streak, tomorrowPlanned, pending: goalsPending },
       stack: { done: stackDone, total: stackItems.length },
@@ -190,6 +210,12 @@ function Dashboard() {
         burn: energy
           ? { resting: Math.round(energy.restingKcal), training: Math.round(energy.workoutKcal) }
           : null,
+      },
+      projects: {
+        days: daysUntilExam(),
+        pct: pctComplete(cfaProgress),
+        done: doneCount(cfaProgress),
+        total: CFA_READINGS.length,
       },
     };
   }, [mounted, openId, tick]);
@@ -375,27 +401,22 @@ function Dashboard() {
             className="md:col-span-3"
           />
           <BentoGridItem
-            id="finance"
+            id="projects"
             index={4}
-            title="Finance"
-            icon={P.finance.icon}
-            accent={P.finance.accent}
-            metric={m ? fmtMoney(m.finance.nw, m.finance.currency) : '—'}
-            sub={
-              m ? (
-                m.finance.nwDelta === 0 ? (
-                  'net worth · all-time'
-                ) : (
-                  <span className={m.finance.nwDelta > 0 ? 'text-good' : 'text-bad'}>
-                    {m.finance.nwDelta > 0 ? '↑' : '↓'}{' '}
-                    {fmtMoney(Math.abs(m.finance.nwDelta), m.finance.currency)} all-time
-                  </span>
-                )
-              ) : undefined
+            title="Projects"
+            icon={P.projects.icon}
+            accent={P.projects.accent}
+            metric={m ? `${m.projects.days}d · ${m.projects.pct}%` : '—'}
+            sub={m ? `${m.projects.done}/${m.projects.total} CFA readings done` : undefined}
+            viz={
+              <MiniRing
+                value={m?.projects.done ?? 0}
+                max={m?.projects.total ?? 1}
+                color={P.projects.accent.from}
+              />
             }
-            viz={<MiniSparkline values={m?.finance.hist ?? []} color={P.finance.accent.from} />}
-            expanded={openId === 'finance'}
-            onOpen={() => open('finance')}
+            expanded={openId === 'projects'}
+            onOpen={() => open('projects')}
             className="md:col-span-3"
           />
           <BentoGridItem
@@ -566,6 +587,7 @@ function Dashboard() {
             {openId === 'gym' && <GymPanel accent={PANELS.gym.accent} />}
             {openId === 'finance' && <FinancePanel accent={PANELS.finance.accent} />}
             {openId === 'nutrition' && <NutritionPanel accent={PANELS.nutrition.accent} />}
+            {openId === 'projects' && <ProjectsPanel accent={PANELS.projects.accent} />}
           </BentoExpandedOverlay>
         )}
       </AnimatePresence>
